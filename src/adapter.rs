@@ -366,22 +366,20 @@ fn progress_secs(d: std::time::Duration) -> u64 {
 fn format_progress_duration(d: std::time::Duration) -> String {
     let secs = progress_secs(d);
     if secs < 60 {
-        return format!("{secs} {}", if secs == 1 { "sec" } else { "secs" });
+        return format!("{secs}s");
     }
 
     let mins = secs / 60;
     if mins < 60 {
-        return format!("{mins} {}", if mins == 1 { "min" } else { "mins" });
+        return format!("{mins}m");
     }
 
     let hrs = mins / 60;
     let rem_mins = mins % 60;
-    let hrs_unit = if hrs == 1 { "hr" } else { "hrs" };
     if rem_mins == 0 {
-        format!("{hrs} {hrs_unit}")
+        format!("{hrs}h")
     } else {
-        let mins_unit = if rem_mins == 1 { "min" } else { "mins" };
-        format!("{hrs} {hrs_unit} {rem_mins} {mins_unit}")
+        format!("{hrs}h{rem_mins}m")
     }
 }
 
@@ -403,10 +401,7 @@ fn render_progress_card(state: &ProgressState, final_state: Option<&str>) -> Str
 fn render_heartbeat(state: &ProgressState) -> String {
     let elapsed = format_progress_duration(state.started.elapsed());
     let idle = format_progress_duration(state.last_activity.elapsed());
-    format!(
-        "⏳ Still working — elapsed {elapsed}, last activity {idle} ago. Status: {}",
-        state.status
-    )
+    format!("⏳ {elapsed} · idle {idle} · {}", state.status)
 }
 
 #[derive(Debug, Default)]
@@ -446,14 +441,20 @@ fn progress_log_page(part: usize, update: &str, message_limit: usize) -> String 
 }
 
 fn progress_update_replace_key(update: &str) -> Option<String> {
-    const HEARTBEAT_PREFIX: &str = "⏳ Still working —";
-    const STATUS_MARKER: &str = ". Status: ";
+    const LEGACY_HEARTBEAT_PREFIX: &str = "⏳ Still working —";
+    const LEGACY_STATUS_MARKER: &str = ". Status: ";
+    const COMPACT_HEARTBEAT_PREFIX: &str = "⏳ ";
+    const COMPACT_IDLE_MARKER: &str = " · idle ";
+    const COMPACT_SEPARATOR: &str = " · ";
 
-    if !update.starts_with(HEARTBEAT_PREFIX) {
+    let status = if update.starts_with(LEGACY_HEARTBEAT_PREFIX) {
+        update.rsplit_once(LEGACY_STATUS_MARKER)?.1.trim()
+    } else if update.starts_with(COMPACT_HEARTBEAT_PREFIX) && update.contains(COMPACT_IDLE_MARKER) {
+        update.rsplit_once(COMPACT_SEPARATOR)?.1.trim()
+    } else {
         return None;
-    }
+    };
 
-    let status = update.rsplit_once(STATUS_MARKER)?.1.trim();
     if status.is_empty() {
         None
     } else {
@@ -1318,10 +1319,7 @@ mod tests {
 
         let heartbeat = render_heartbeat(&state);
 
-        assert!(heartbeat.contains("⏳ Still working"));
-        assert!(heartbeat.contains("elapsed 2 mins"));
-        assert!(heartbeat.contains("last activity 30 secs ago"));
-        assert!(heartbeat.contains("Status: thinking"));
+        assert_eq!(heartbeat, "⏳ 2m · idle 30s · thinking");
     }
 
     #[test]
@@ -1334,21 +1332,19 @@ mod tests {
 
         let heartbeat = render_heartbeat(&state);
 
-        assert!(heartbeat.contains("elapsed 1 hr 10 mins"));
-        assert!(heartbeat.contains("last activity 2 hrs 34 mins ago"));
-        assert!(heartbeat.contains("Status: running long command"));
+        assert_eq!(heartbeat, "⏳ 1h10m · idle 2h34m · running long command");
     }
 
     #[test]
     fn progress_log_appends_different_status_updates_to_existing_message() {
-        let first = "⏳ Still working — elapsed 60s, last activity 1s ago. Status: thinking";
+        let first = "⏳ 1m · idle 1s · thinking";
         let (page, part, new_msg) = append_progress_log_content(None, 0, first, 500);
         assert!(new_msg);
         assert_eq!(part, 1);
         assert!(page.contains("⏳ **Progress updates**"));
         assert!(page.contains(first));
 
-        let second = "⏳ Still working — elapsed 120s, last activity 1s ago. Status: running tests";
+        let second = "⏳ 2m · idle 1s · running tests";
         let (page, part, new_msg) = append_progress_log_content(Some(&page), part, second, 500);
         assert!(!new_msg);
         assert_eq!(part, 1);
@@ -1358,33 +1354,29 @@ mod tests {
 
     #[test]
     fn progress_log_replaces_repeated_heartbeat_with_same_status() {
-        let first =
-            "⏳ Still working — elapsed 60s, last activity 1s ago. Status: running long command";
+        let first = "⏳ 1m · idle 1s · running long command";
         let (page, part, new_msg) = append_progress_log_content(None, 0, first, 500);
         assert!(new_msg);
 
-        let second =
-            "⏳ Still working — elapsed 120s, last activity 61s ago. Status: running long command";
+        let second = "⏳ 2m · idle 1m · running long command";
         let (page, part, new_msg) = append_progress_log_content(Some(&page), part, second, 500);
 
         assert!(!new_msg);
         assert_eq!(part, 1);
         assert!(!page.contains(first));
         assert!(page.contains(second));
-        assert_eq!(page.matches("⏳ Still working").count(), 1);
+        assert_eq!(page.matches(" · idle ").count(), 1);
     }
 
     #[test]
     fn progress_log_replaces_repeated_heartbeat_while_preserving_trace_lines() {
-        let first =
-            "⏳ Still working — elapsed 60s, last activity 1s ago. Status: running long command";
+        let first = "⏳ 1m · idle 1s · running long command";
         let (page, part, _) = append_progress_log_content(None, 0, first, 500);
         let trace = "• ran shell command";
         let (page, part, new_msg) = append_progress_log_content(Some(&page), part, trace, 500);
         assert!(!new_msg);
 
-        let second =
-            "⏳ Still working — elapsed 120s, last activity 61s ago. Status: running long command";
+        let second = "⏳ 2m · idle 1m · running long command";
         let (page, part, new_msg) = append_progress_log_content(Some(&page), part, second, 500);
 
         assert!(!new_msg);
@@ -1392,7 +1384,7 @@ mod tests {
         assert!(!page.contains(first));
         assert!(page.contains(trace));
         assert!(page.contains(second));
-        assert_eq!(page.matches("⏳ Still working").count(), 1);
+        assert_eq!(page.matches(" · idle ").count(), 1);
     }
 
     #[test]
