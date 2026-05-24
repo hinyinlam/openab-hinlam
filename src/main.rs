@@ -1,6 +1,7 @@
 mod acp;
 mod adapter;
 mod bot_turns;
+mod claude_trace;
 mod config;
 mod cron;
 mod discord;
@@ -147,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
     let router = Arc::new(AdapterRouter::new(
         pool.clone(),
         cfg.reactions,
+        cfg.progress,
         cfg.markdown.tables,
         cfg.pool.prompt_hard_timeout_secs,
         cfg.pool.liveness_check_secs,
@@ -378,7 +380,20 @@ async fn main() -> anyhow::Result<()> {
         let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
         let trusted_bot_ids =
             parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
-        let allowed_role_ids = parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
+        let allowed_role_ids =
+            parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
+        let collaboration_channels = parse_id_set(
+            &discord_cfg.collaboration_channels,
+            "discord.collaboration_channels",
+        )?;
+        let home_channel_id = discord_cfg
+            .home_channel_id
+            .as_deref()
+            .map(|id| {
+                id.parse::<u64>()
+                    .map_err(|e| anyhow::anyhow!("invalid discord.home_channel_id {id:?}: {e}"))
+            })
+            .transpose()?;
         info!(
             allow_all_channels,
             allow_all_users,
@@ -386,6 +401,9 @@ async fn main() -> anyhow::Result<()> {
             users = allowed_users.len(),
             trusted_bots = trusted_bot_ids.len(),
             role_triggers = allowed_role_ids.len(),
+            collaboration_channels = collaboration_channels.len(),
+            home_channel_configured = home_channel_id.is_some(),
+            route_collaboration_to_home = discord_cfg.route_collaboration_to_home,
             allow_bot_messages = ?discord_cfg.allow_bot_messages,
             allow_user_messages = ?discord_cfg.allow_user_messages,
             allow_dm = discord_cfg.allow_dm,
@@ -436,6 +454,10 @@ async fn main() -> anyhow::Result<()> {
             dispatcher: discord_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            collaboration_channels,
+            home_channel_id,
+            route_collaboration_to_home: discord_cfg.route_collaboration_to_home,
+            collaboration_ack: discord_cfg.collaboration_ack,
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

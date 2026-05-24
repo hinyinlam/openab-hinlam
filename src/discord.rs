@@ -9,14 +9,18 @@ use crate::remind::{self, ReminderStore};
 use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
-    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage,
-    GetMessages,
+    CreateForumPost, CreateInteractionResponse, CreateInteractionResponseFollowup,
+    CreateInteractionResponseMessage, CreateMessage, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, CreateThread, EditMessage, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
-use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
-use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
+use serenity::model::application::{
+    Command, CommandOptionType, ComponentInteractionDataKind, Interaction,
+};
+use serenity::model::channel::{
+    AutoArchiveDuration, ChannelType, Message, MessageType, ReactionType,
+};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
@@ -221,6 +225,14 @@ pub struct Handler {
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Shared channels/forum parents used as low-noise collaboration meeting rooms.
+    pub collaboration_channels: HashSet<u64>,
+    /// Bot-specific home/seat channel for detailed routed work output.
+    pub home_channel_id: Option<u64>,
+    /// Route meeting-room mentions to `home_channel_id` when configured.
+    pub route_collaboration_to_home: bool,
+    /// Post a short acknowledgement in the source meeting room when routing.
+    pub collaboration_ack: bool,
 }
 
 impl Handler {
@@ -644,7 +656,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
+        let mut prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
 
         // No text and no attachments → skip
         if prompt.is_empty() && msg.attachments.is_empty() {
@@ -786,7 +798,7 @@ impl EventHandler for Handler {
             "processing"
         );
 
-        let thread_channel = if in_thread || is_dm {
+        let mut thread_channel = if in_thread || is_dm {
             // DMs use the DM channel directly (no threads in DMs).
             ChannelRef {
                 platform: "discord".into(),
@@ -804,6 +816,46 @@ impl EventHandler for Handler {
                 }
             }
         };
+
+        let routed_to_home = self.route_collaboration_to_home
+            && !is_dm
+            && is_collaboration_source(
+                channel_id,
+                thread_parent_id.as_deref(),
+                &self.collaboration_channels,
+            )
+            && self.home_channel_id.is_some();
+        if routed_to_home {
+            let home_channel_id = self.home_channel_id.expect("checked is_some");
+            if self.collaboration_ack {
+                let ack = format!(
+                    "📨 Routed detailed work to this bot's seat: <#{home_channel_id}>. Progress and final output will be posted there."
+                );
+                if let Err(e) = adapter.send_message(&thread_channel, &ack).await {
+                    tracing::warn!(error = %e, "failed to send collaboration routing acknowledgement");
+                }
+            }
+            prompt = annotate_routed_prompt(
+                &prompt,
+                &msg.channel_id.get().to_string(),
+                thread_parent_id.as_deref(),
+                &msg.id.to_string(),
+            );
+            thread_channel = match routed_home_channel(
+                &ctx,
+                &thread_channel,
+                home_channel_id,
+                &prompt,
+            )
+            .await
+            {
+                Ok(ch) => ch,
+                Err(e) => {
+                    tracing::warn!(error = %e, home_channel_id, "failed to prepare home/seat destination; falling back to raw home channel");
+                    raw_home_channel(&thread_channel, home_channel_id)
+                }
+            };
+        }
 
         // Notify user if any images couldn't be processed.
         if !failed_image_files.is_empty() {
@@ -834,7 +886,7 @@ impl EventHandler for Handler {
         // was built before the thread existed. Patch it so the agent sees
         // thread_id on the very first turn.
         let mut sender = sender;
-        if sender.thread_id.is_none() && thread_channel.parent_id.is_some() {
+        if !routed_to_home && sender.thread_id.is_none() && thread_channel.parent_id.is_some() {
             sender.thread_id = Some(thread_channel.channel_id.clone());
         }
 
@@ -889,21 +941,30 @@ impl EventHandler for Handler {
             CreateCommand::new("reset").description("Reset the conversation session"),
             CreateCommand::new("remind")
                 .description("Set a one-shot reminder to mention users/roles after a delay")
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "targets",
-                    "Users/roles to mention (e.g. @user1 @role1)",
-                ).required(true))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "message",
-                    "Reminder message",
-                ).required(true))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "delay",
-                    "Delay before firing (e.g. 30m, 2h, 1d)",
-                ).required(true)),
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "targets",
+                        "Users/roles to mention (e.g. @user1 @role1)",
+                    )
+                    .required(true),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "message",
+                        "Reminder message",
+                    )
+                    .required(true),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "delay",
+                        "Delay before firing (e.g. 30m, 2h, 1d)",
+                    )
+                    .required(true),
+                ),
             CreateCommand::new("export-thread")
                 .description("Download this thread as a text file")
                 .add_option(CreateCommandOption::new(
@@ -1272,15 +1333,18 @@ impl Handler {
 
         // Extract options
         let opts = &cmd.data.options;
-        let targets_raw = opts.iter()
+        let targets_raw = opts
+            .iter()
             .find(|o| o.name == "targets")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
-        let message = opts.iter()
+        let message = opts
+            .iter()
             .find(|o| o.name == "message")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
-        let delay_raw = opts.iter()
+        let delay_raw = opts
+            .iter()
             .find(|o| o.name == "delay")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
@@ -1342,7 +1406,10 @@ impl Handler {
         if targets.len() > remind::MAX_TARGETS {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content(format!("⚠️ Too many targets (max {}). Use a @role instead.", remind::MAX_TARGETS))
+                    .content(format!(
+                        "⚠️ Too many targets (max {}). Use a @role instead.",
+                        remind::MAX_TARGETS
+                    ))
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -1431,9 +1498,7 @@ impl Handler {
                 );
                 (in_thread, gc.name.clone())
             }
-            Ok(serenity::model::channel::Channel::Private(_)) => {
-                (self.allow_dm, "dm".to_string())
-            }
+            Ok(serenity::model::channel::Channel::Private(_)) => (self.allow_dm, "dm".to_string()),
             Ok(_) => (false, "channel".to_string()),
             Err(e) => {
                 tracing::warn!(channel_id = %channel_id, error = %e, "failed to inspect channel for export");
@@ -1455,16 +1520,34 @@ impl Handler {
 
         // --- Parse and validate filter params (mutual exclusion) ---
         let opts = &cmd.data.options;
-        let limit_opt = opts.iter().find(|o| o.name == "limit").and_then(|o| o.value.as_i64());
-        let since_opt = opts.iter().find(|o| o.name == "since").and_then(|o| o.value.as_str());
-        let days_opt = opts.iter().find(|o| o.name == "days").and_then(|o| o.value.as_i64());
-        let all_opt = opts.iter().find(|o| o.name == "all").and_then(|o| o.value.as_bool()).unwrap_or(false);
+        let limit_opt = opts
+            .iter()
+            .find(|o| o.name == "limit")
+            .and_then(|o| o.value.as_i64());
+        let since_opt = opts
+            .iter()
+            .find(|o| o.name == "since")
+            .and_then(|o| o.value.as_str());
+        let days_opt = opts
+            .iter()
+            .find(|o| o.name == "days")
+            .and_then(|o| o.value.as_i64());
+        let all_opt = opts
+            .iter()
+            .find(|o| o.name == "all")
+            .and_then(|o| o.value.as_bool())
+            .unwrap_or(false);
 
-        let filter_count = limit_opt.is_some() as u8 + since_opt.is_some() as u8 + days_opt.is_some() as u8 + all_opt as u8;
+        let filter_count = limit_opt.is_some() as u8
+            + since_opt.is_some() as u8
+            + days_opt.is_some() as u8
+            + all_opt as u8;
         if filter_count > 1 {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.")
+                    .content(
+                        "⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.",
+                    )
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -1834,7 +1917,10 @@ async fn export_channel_messages(
 
     let filename = export_filename(channel_id, channel_name);
     if attachment_size_limit < 2048 {
-        tracing::warn!(attachment_size_limit, "attachment_size_limit is very small; export will likely be truncated");
+        tracing::warn!(
+            attachment_size_limit,
+            "attachment_size_limit is very small; export will likely be truncated"
+        );
     }
     let max_bytes = usize::try_from(attachment_size_limit)
         .unwrap_or(8 * 1024 * 1024)
@@ -1904,10 +1990,7 @@ fn format_export_message(msg: &Message) -> String {
     let bot_marker = if msg.author.bot { " [bot]" } else { "" };
     let mut out = format!(
         "[{}] {}{} ({})\n",
-        msg.timestamp,
-        msg.author.name,
-        bot_marker,
-        msg.author.id
+        msg.timestamp, msg.author.name, bot_marker, msg.author.id
     );
 
     if msg.content.is_empty() {
@@ -2190,6 +2273,95 @@ fn should_skip_thread_creation(in_thread: bool, is_dm: bool) -> bool {
     in_thread || is_dm
 }
 
+fn is_collaboration_source(
+    channel_id: u64,
+    thread_parent_id: Option<&str>,
+    collaboration_channels: &HashSet<u64>,
+) -> bool {
+    collaboration_channels.contains(&channel_id)
+        || thread_parent_id
+            .and_then(|id| id.parse::<u64>().ok())
+            .is_some_and(|id| collaboration_channels.contains(&id))
+}
+
+fn raw_home_channel(source: &ChannelRef, home_channel_id: u64) -> ChannelRef {
+    ChannelRef {
+        platform: "discord".into(),
+        channel_id: home_channel_id.to_string(),
+        thread_id: None,
+        parent_id: source.parent_id.clone(),
+        origin_event_id: source.origin_event_id.clone(),
+    }
+}
+
+async fn routed_home_channel(
+    ctx: &Context,
+    source: &ChannelRef,
+    home_channel_id: u64,
+    prompt: &str,
+) -> anyhow::Result<ChannelRef> {
+    let channel_id = ChannelId::new(home_channel_id);
+    let channel = channel_id.to_channel(&ctx.http).await?;
+    if matches!(
+        channel,
+        serenity::model::channel::Channel::Guild(ref guild_channel)
+            if guild_channel.kind == ChannelType::Forum
+    ) {
+        let first_line = prompt
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("OpenAB routed work");
+        let safe_title = forum_post_title(first_line);
+        let post = channel_id
+            .create_forum_post(
+                &ctx.http,
+                CreateForumPost::new(
+                    safe_title,
+                    CreateMessage::new().content("📥 Routed work received from the meeting room. Progress and final output will continue in this office-seat post."),
+                )
+                .auto_archive_duration(AutoArchiveDuration::OneDay),
+            )
+            .await?;
+        Ok(ChannelRef {
+            platform: "discord".into(),
+            channel_id: post.id.to_string(),
+            thread_id: None,
+            parent_id: Some(home_channel_id.to_string()),
+            origin_event_id: source.origin_event_id.clone(),
+        })
+    } else {
+        Ok(raw_home_channel(source, home_channel_id))
+    }
+}
+
+fn forum_post_title(prompt: &str) -> String {
+    let mut title = prompt
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.len() > 80 {
+        title.truncate(80);
+    }
+    if title.len() < 2 {
+        "OpenAB routed work".to_string()
+    } else {
+        title
+    }
+}
+
+fn annotate_routed_prompt(
+    prompt: &str,
+    source_channel_id: &str,
+    source_parent_id: Option<&str>,
+    source_message_id: &str,
+) -> String {
+    format!(
+        "[Routed work item from Discord collaboration space]\nsource_channel_id: {source_channel_id}\nsource_parent_id: {}\nsource_message_id: {source_message_id}\n\nTask:\n{prompt}",
+        source_parent_id.unwrap_or("none"),
+    )
+}
+
 /// Pure decision function: should this message be processed or ignored?
 /// Returns `true` if the message should be processed (bot responds).
 /// Extracted from the EventHandler::message gating logic for testability.
@@ -2235,7 +2407,7 @@ fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
+    use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
 
     // --- resolve_mentions tests ---
 
@@ -3021,23 +3193,87 @@ mod tests {
         assert!(!should_skip_thread_creation(false, false));
     }
 
+    #[test]
+    fn collaboration_source_matches_forum_parent_thread() {
+        let collaboration_channels = HashSet::from([1507727920926425208]);
+
+        assert!(is_collaboration_source(
+            1508000000000000000,
+            Some("1507727920926425208"),
+            &collaboration_channels,
+        ));
+    }
+
+    #[test]
+    fn collaboration_source_matches_plain_collaboration_channel() {
+        let collaboration_channels = HashSet::from([1507727920926425208]);
+
+        assert!(is_collaboration_source(
+            1507727920926425208,
+            None,
+            &collaboration_channels,
+        ));
+    }
+
+    #[test]
+    fn collaboration_routing_uses_home_channel_and_keeps_source_parent() {
+        let source = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "1508000000000000000".into(),
+            thread_id: None,
+            parent_id: Some("1507727920926425208".into()),
+            origin_event_id: None,
+        };
+        let routed = raw_home_channel(&source, 1507720307044257823);
+
+        assert_eq!(routed.platform, "discord");
+        assert_eq!(routed.channel_id, "1507720307044257823");
+        assert_eq!(routed.thread_id, None);
+        assert_eq!(routed.parent_id, Some("1507727920926425208".into()));
+    }
+
+    #[test]
+    fn routed_prompt_includes_source_metadata_and_task() {
+        let prompt = annotate_routed_prompt(
+            "please check this schema issue",
+            "1508000000000000000",
+            Some("1507727920926425208"),
+            "1509000000000000000",
+        );
+
+        assert!(prompt.contains("Routed work item from Discord collaboration space"));
+        assert!(prompt.contains("source_channel_id: 1508000000000000000"));
+        assert!(prompt.contains("source_parent_id: 1507727920926425208"));
+        assert!(prompt.contains("source_message_id: 1509000000000000000"));
+        assert!(prompt.contains("please check this schema issue"));
+    }
+
     // --- WarnAndStop dedup tests (#530) ---
 
     #[test]
     fn dedup_detects_existing_bot_warning() {
-        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        let msg = format!(
+            "{} (20/20). A human must reply.",
+            BOT_TURN_LIMIT_WARNING_PREFIX
+        );
         assert!(turn_limit_warning_present(&[(true, &msg)]));
     }
 
     #[test]
     fn dedup_ignores_human_warning_text() {
-        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        let msg = format!(
+            "{} (20/20). A human must reply.",
+            BOT_TURN_LIMIT_WARNING_PREFIX
+        );
         assert!(!turn_limit_warning_present(&[(false, &msg)]));
     }
 
     #[test]
     fn dedup_returns_false_when_no_warning() {
-        assert!(!turn_limit_warning_present(&[(true, "hello"), (false, "world")]));
+        assert!(!turn_limit_warning_present(&[
+            (true, "hello"),
+            (false, "world")
+        ]));
     }
 
     #[test]

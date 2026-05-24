@@ -76,6 +76,8 @@ pub struct Config {
     #[serde(default)]
     pub reactions: ReactionsConfig,
     #[serde(default)]
+    pub progress: ProgressConfig,
+    #[serde(default)]
     pub stt: SttConfig,
     #[serde(default)]
     pub markdown: MarkdownConfig,
@@ -170,6 +172,21 @@ pub struct DiscordConfig {
     /// Default: false (opt-in). `allowed_users` still applies in DMs.
     #[serde(default)]
     pub allow_dm: bool,
+    /// Shared Discord channels/forum parents that act as collaboration meeting rooms.
+    /// When `route_collaboration_to_home` is true and `home_channel_id` is set,
+    /// mentions from these spaces are acknowledged in-place but detailed work is
+    /// dispatched to `home_channel_id`.
+    #[serde(default)]
+    pub collaboration_channels: Vec<String>,
+    /// Bot-specific home/seat channel for routed collaboration work.
+    pub home_channel_id: Option<String>,
+    /// Route work mentioned in collaboration channels to `home_channel_id`.
+    /// Default false to preserve existing same-channel behavior.
+    #[serde(default)]
+    pub route_collaboration_to_home: bool,
+    /// Post a short acknowledgement in the meeting room when routing to home.
+    #[serde(default = "default_true")]
+    pub collaboration_ack: bool,
     /// Message dispatch mode. Default: per-message (v0.8.2-beta.1 behaviour).
     #[serde(default)]
     pub message_processing_mode: MessageProcessingMode,
@@ -458,6 +475,53 @@ pub struct ReactionTiming {
     pub error_hold_ms: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgressConfig {
+    /// Enable Discord-visible long-running task progress. Default off to avoid
+    /// changing behavior for existing deployments.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Send one editable progress-card message per active turn.
+    #[serde(default = "default_true")]
+    pub card_enabled: bool,
+    /// Send periodic heartbeat messages while a turn is still running.
+    #[serde(default = "default_true")]
+    pub heartbeat_enabled: bool,
+    /// How often to edit the progress card.
+    #[serde(default = "default_progress_card_update_secs")]
+    pub card_update_secs: u64,
+    /// How often to emit heartbeat messages.
+    #[serde(default = "default_progress_heartbeat_secs")]
+    pub heartbeat_secs: u64,
+    /// Tail supported local activity transcripts and append sanitized activity
+    /// summaries to the progress log. Default off; backend-specific enrichment.
+    #[serde(default)]
+    pub activity_trace_enabled: bool,
+    /// Tail Claude Code's local JSONL transcript and append sanitized activity
+    /// summaries to the progress log. Backward-compatible alias for Claude-only
+    /// activity tracing.
+    #[serde(default)]
+    pub claude_jsonl_trace_enabled: bool,
+    /// Tail Codex's local JSONL rollout transcript and append sanitized activity
+    /// summaries to the progress log. Default off; backend-specific enrichment.
+    #[serde(default)]
+    pub codex_jsonl_trace_enabled: bool,
+}
+
+impl ProgressConfig {
+    pub fn claude_activity_trace_enabled(&self) -> bool {
+        self.activity_trace_enabled || self.claude_jsonl_trace_enabled
+    }
+
+    pub fn codex_activity_trace_enabled(&self) -> bool {
+        self.activity_trace_enabled || self.codex_jsonl_trace_enabled
+    }
+
+    pub fn any_activity_trace_enabled(&self) -> bool {
+        self.claude_activity_trace_enabled() || self.codex_activity_trace_enabled()
+    }
+}
+
 // --- defaults ---
 
 fn default_working_dir() -> String {
@@ -516,6 +580,12 @@ fn default_done_hold_ms() -> u64 {
 fn default_error_hold_ms() -> u64 {
     2_500
 }
+fn default_progress_card_update_secs() -> u64 {
+    15
+}
+fn default_progress_heartbeat_secs() -> u64 {
+    120
+}
 
 impl Default for PoolConfig {
     fn default() -> Self {
@@ -562,6 +632,21 @@ impl Default for ReactionTiming {
             stall_hard_ms: default_stall_hard_ms(),
             done_hold_ms: default_done_hold_ms(),
             error_hold_ms: default_error_hold_ms(),
+        }
+    }
+}
+
+impl Default for ProgressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            card_enabled: true,
+            heartbeat_enabled: true,
+            card_update_secs: default_progress_card_update_secs(),
+            heartbeat_secs: default_progress_heartbeat_secs(),
+            activity_trace_enabled: false,
+            claude_jsonl_trace_enabled: false,
+            codex_jsonl_trace_enabled: false,
         }
     }
 }

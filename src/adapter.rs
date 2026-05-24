@@ -5,7 +5,8 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::{ReactionsConfig, ToolDisplay};
+use crate::claude_trace::ActivityTrace;
+use crate::config::{ProgressConfig, ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
@@ -39,7 +40,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         "reply_to" => {
                             let v = value.trim();
                             // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
                                 directives.reply_to = Some(v.to_string());
                             }
                         }
@@ -262,6 +268,296 @@ pub trait ChatAdapter: Send + Sync + 'static {
     fn use_streaming(&self, other_bot_present: bool) -> bool;
 }
 
+// --- Long-running progress display ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptAbort {
+    None,
+    AgentDied,
+    HardTimeout,
+}
+
+impl PromptAbort {
+    fn should_reset_session(self) -> bool {
+        matches!(self, Self::AgentDied | Self::HardTimeout)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PromptRunOutcome {
+    abort: PromptAbort,
+}
+
+impl PromptRunOutcome {
+    fn from_abort(abort: PromptAbort) -> Self {
+        Self { abort }
+    }
+
+    fn should_reset_session(self) -> bool {
+        self.abort.should_reset_session()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProgressState {
+    started: std::time::Instant,
+    last_activity: std::time::Instant,
+    status: String,
+    running_tool: Option<String>,
+    completed_tools: usize,
+    failed_tools: usize,
+}
+
+impl ProgressState {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            started: now,
+            last_activity: now,
+            status: "queued".into(),
+            running_tool: None,
+            completed_tools: 0,
+            failed_tools: 0,
+        }
+    }
+
+    fn mark_activity(&mut self, status: impl Into<String>) {
+        self.last_activity = std::time::Instant::now();
+        self.status = status.into();
+    }
+
+    fn start_tool(&mut self, title: &str) {
+        let title = sanitize_title(title);
+        self.running_tool = Some(title.clone());
+        self.mark_activity(format!("running `{title}`"));
+    }
+
+    fn finish_tool(&mut self, title: &str, failed: bool) {
+        self.running_tool = None;
+        if failed {
+            self.failed_tools += 1;
+        } else {
+            self.completed_tools += 1;
+        }
+        let label = if title.is_empty() {
+            "tool".to_string()
+        } else {
+            format!("`{}`", sanitize_title(title))
+        };
+        let verb = if failed { "failed" } else { "finished" };
+        self.mark_activity(format!("{verb} {label}"));
+    }
+
+    fn mark_done(&mut self) {
+        self.running_tool = None;
+        self.mark_activity("done");
+    }
+
+    fn mark_error(&mut self, message: &str) {
+        self.running_tool = None;
+        self.mark_activity(format!("error: {message}"));
+    }
+}
+
+fn progress_secs(d: std::time::Duration) -> u64 {
+    d.as_secs().max(1)
+}
+
+fn format_progress_duration(d: std::time::Duration) -> String {
+    let secs = progress_secs(d);
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+
+    let hrs = mins / 60;
+    let rem_mins = mins % 60;
+    if rem_mins == 0 {
+        format!("{hrs}h")
+    } else {
+        format!("{hrs}h{rem_mins}m")
+    }
+}
+
+fn render_progress_card(state: &ProgressState, final_state: Option<&str>) -> String {
+    let elapsed = progress_secs(state.started.elapsed());
+    let idle = progress_secs(state.last_activity.elapsed());
+    let status = final_state.unwrap_or(&state.status);
+    let running = state
+        .running_tool
+        .as_ref()
+        .map(|tool| format!("\nCurrent: `{tool}`"))
+        .unwrap_or_default();
+    format!(
+        "📊 **Agent progress**\nStatus: {status}\nElapsed: {elapsed}s\nLast activity: {idle}s ago\nTools: ✅ {} · ❌ {}{running}",
+        state.completed_tools, state.failed_tools
+    )
+}
+
+fn render_heartbeat(state: &ProgressState) -> String {
+    let elapsed = format_progress_duration(state.started.elapsed());
+    let idle = format_progress_duration(state.last_activity.elapsed());
+    format!("⏳ {elapsed} · idle {idle} · {}", state.status)
+}
+
+#[derive(Debug, Default)]
+struct ProgressLogState {
+    current_msg: Option<MessageRef>,
+    current_content: String,
+    current_part: usize,
+}
+
+fn progress_log_header(part: usize) -> String {
+    if part <= 1 {
+        "⏳ **Progress updates**".to_string()
+    } else {
+        format!("⏳ **Progress updates (part {part})**")
+    }
+}
+
+fn truncate_progress_update(update: &str, available_chars: usize) -> String {
+    if update.chars().count() <= available_chars {
+        update.to_string()
+    } else if available_chars <= 1 {
+        "…".to_string()
+    } else {
+        format::truncate_chars_tail(update, available_chars)
+    }
+}
+
+fn progress_log_page(part: usize, update: &str, message_limit: usize) -> String {
+    let header = progress_log_header(part);
+    let header_len = header.chars().count();
+    let available = message_limit.saturating_sub(header_len + 1).max(1);
+    let update = truncate_progress_update(update, available);
+    format!(
+        "{header}
+{update}"
+    )
+}
+
+fn progress_update_replace_key(update: &str) -> Option<String> {
+    const LEGACY_HEARTBEAT_PREFIX: &str = "⏳ Still working —";
+    const LEGACY_STATUS_MARKER: &str = ". Status: ";
+    const COMPACT_HEARTBEAT_PREFIX: &str = "⏳ ";
+    const COMPACT_IDLE_MARKER: &str = " · idle ";
+    const COMPACT_SEPARATOR: &str = " · ";
+
+    let status = if update.starts_with(LEGACY_HEARTBEAT_PREFIX) {
+        update.rsplit_once(LEGACY_STATUS_MARKER)?.1.trim()
+    } else if update.starts_with(COMPACT_HEARTBEAT_PREFIX) && update.contains(COMPACT_IDLE_MARKER) {
+        update.rsplit_once(COMPACT_SEPARATOR)?.1.trim()
+    } else {
+        return None;
+    };
+
+    if status.is_empty() {
+        None
+    } else {
+        Some(format!("heartbeat:{status}"))
+    }
+}
+
+fn progress_log_line_replace_key(line: &str) -> Option<String> {
+    progress_update_replace_key(line)
+}
+
+fn replace_progress_log_line(current: &str, replace_key: &str, update: &str) -> Option<String> {
+    let mut lines: Vec<&str> = current.lines().collect();
+    let line_index = lines.iter().enumerate().rev().find_map(|(idx, line)| {
+        (progress_log_line_replace_key(line).as_deref() == Some(replace_key)).then_some(idx)
+    })?;
+
+    lines[line_index] = update;
+    Some(lines.join("\n"))
+}
+
+fn append_progress_log_content(
+    current_content: Option<&str>,
+    current_part: usize,
+    update: &str,
+    message_limit: usize,
+) -> (String, usize, bool) {
+    if let Some(current) = current_content {
+        if let Some(replace_key) = progress_update_replace_key(update) {
+            if let Some(candidate) = replace_progress_log_line(current, &replace_key, update) {
+                if candidate.chars().count() <= message_limit {
+                    return (candidate, current_part.max(1), false);
+                }
+            }
+        }
+
+        let candidate = format!(
+            "{current}
+{update}"
+        );
+        if candidate.chars().count() <= message_limit {
+            return (candidate, current_part.max(1), false);
+        }
+        let next_part = current_part.max(1) + 1;
+        (
+            progress_log_page(next_part, update, message_limit),
+            next_part,
+            true,
+        )
+    } else {
+        let part = current_part.max(1);
+        (progress_log_page(part, update, message_limit), part, true)
+    }
+}
+
+async fn append_progress_log_update(
+    adapter: &Arc<dyn ChatAdapter>,
+    thread_channel: &ChannelRef,
+    log: &mut ProgressLogState,
+    update: String,
+    message_limit: usize,
+) {
+    let (next_content, next_part, needs_new_message) = append_progress_log_content(
+        log.current_msg
+            .as_ref()
+            .map(|_| log.current_content.as_str()),
+        log.current_part,
+        &update,
+        message_limit,
+    );
+
+    if needs_new_message {
+        match adapter.send_message(thread_channel, &next_content).await {
+            Ok(msg) => {
+                log.current_msg = Some(msg);
+                log.current_content = next_content;
+                log.current_part = next_part;
+            }
+            Err(e) => tracing::warn!(error = ?e, "progress log send failed"),
+        }
+        return;
+    }
+
+    if let Some(msg) = &log.current_msg {
+        match adapter.edit_message(msg, &next_content).await {
+            Ok(()) => {
+                log.current_content = next_content;
+                log.current_part = next_part;
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "progress log edit failed; sending a new progress log part");
+                let fallback_part = log.current_part.max(1) + 1;
+                let fallback = progress_log_page(fallback_part, &update, message_limit);
+                if let Ok(new_msg) = adapter.send_message(thread_channel, &fallback).await {
+                    log.current_msg = Some(new_msg);
+                    log.current_content = fallback;
+                    log.current_part = fallback_part;
+                }
+            }
+        }
+    }
+}
+
 // --- AdapterRouter ---
 
 /// Shared logic for routing messages to ACP agents, managing sessions,
@@ -269,6 +565,7 @@ pub trait ChatAdapter: Send + Sync + 'static {
 pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
+    progress_config: ProgressConfig,
     table_mode: TableMode,
     prompt_hard_timeout: std::time::Duration,
     /// Polling cadence for the recv-loop liveness check (#732).
@@ -279,6 +576,7 @@ impl AdapterRouter {
     pub fn new(
         pool: Arc<SessionPool>,
         reactions_config: ReactionsConfig,
+        progress_config: ProgressConfig,
         table_mode: TableMode,
         prompt_hard_timeout_secs: u64,
         liveness_check_secs: u64,
@@ -295,6 +593,7 @@ impl AdapterRouter {
         Self {
             pool,
             reactions_config,
+            progress_config,
             table_mode,
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
@@ -464,19 +763,58 @@ impl AdapterRouter {
         let tool_display = self.reactions_config.tool_display;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        let progress_config = self.progress_config.clone();
 
-        self.pool
+        let outcome = self
+            .pool
             .with_connection(thread_key, |conn| {
                 let content_blocks = content_blocks.clone();
                 Box::pin(async move {
                     let reset = conn.session_reset;
                     conn.session_reset = false;
 
-                    let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
-                    reactions.set_thinking().await;
-
                     let mut text_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
+                    let mut progress = ProgressState::new();
+                    let mut progress_log = ProgressLogState::default();
+                    let mut activity_trace = ActivityTrace::disabled();
+                    let progress_card_msg = if progress_config.enabled && progress_config.card_enabled {
+                        adapter
+                            .send_message(&thread_channel, &render_progress_card(&progress, None))
+                            .await
+                            .ok()
+                    } else {
+                        None
+                    };
+                    let mut progress_card_interval = tokio::time::interval(
+                        std::time::Duration::from_secs(progress_config.card_update_secs.max(1)),
+                    );
+                    let mut heartbeat_interval = tokio::time::interval(
+                        std::time::Duration::from_secs(progress_config.heartbeat_secs.max(1)),
+                    );
+                    let mut liveness_interval = tokio::time::interval(liveness_check_interval.max(
+                        std::time::Duration::from_secs(1),
+                    ));
+                    // Consume the immediate first tick so updates happen after the configured delay.
+                    progress_card_interval.tick().await;
+                    heartbeat_interval.tick().await;
+                    liveness_interval.tick().await;
+
+                    let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
+                    if progress_config.any_activity_trace_enabled() {
+                        activity_trace = ActivityTrace::new(
+                            conn.acp_session_id.as_deref(),
+                            progress_config.claude_activity_trace_enabled(),
+                            progress_config.codex_activity_trace_enabled(),
+                        );
+                    }
+                    progress.mark_activity("thinking");
+                    if let Some(msg) = &progress_card_msg {
+                        let _ = adapter
+                            .edit_message(msg, &render_progress_card(&progress, None))
+                            .await;
+                    }
+                    reactions.set_thinking().await;
 
                     if reset {
                         text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
@@ -529,6 +867,7 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    let mut prompt_abort = PromptAbort::None;
                     let prompt_start = tokio::time::Instant::now();
                     loop {
                         let notification = tokio::select! {
@@ -537,9 +876,39 @@ impl AdapterRouter {
                                 // Reader saw EOF and already drained pending; nothing to abandon.
                                 None => break,
                             },
-                            _ = tokio::time::sleep(liveness_check_interval) => {
+                            _ = progress_card_interval.tick(), if progress_config.enabled && progress_config.card_enabled && progress_card_msg.is_some() => {
+                                if let Some(msg) = &progress_card_msg {
+                                    let _ = adapter
+                                        .edit_message(msg, &render_progress_card(&progress, None))
+                                        .await;
+                                }
+                                continue;
+                            }
+                            _ = heartbeat_interval.tick(), if progress_config.enabled && progress_config.heartbeat_enabled => {
+                                append_progress_log_update(
+                                    &adapter,
+                                    &thread_channel,
+                                    &mut progress_log,
+                                    render_heartbeat(&progress),
+                                    message_limit,
+                                ).await;
+                                if progress_config.any_activity_trace_enabled() {
+                                    if let Some(summary) = activity_trace.poll_summary() {
+                                        append_progress_log_update(
+                                            &adapter,
+                                            &thread_channel,
+                                            &mut progress_log,
+                                            summary,
+                                            message_limit,
+                                        ).await;
+                                    }
+                                }
+                                continue;
+                            }
+                            _ = liveness_interval.tick() => {
                                 if !conn.alive() {
                                     response_error = Some("Agent process died".into());
+                                    prompt_abort = PromptAbort::AgentDied;
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
@@ -548,6 +917,7 @@ impl AdapterRouter {
                                         "Agent exceeded hard timeout ({}s)",
                                         prompt_hard_timeout.as_secs(),
                                     ));
+                                    prompt_abort = PromptAbort::HardTimeout;
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
@@ -572,6 +942,7 @@ impl AdapterRouter {
                         if let Some(event) = classify_notification(&notification) {
                             match event {
                                 AcpEvent::Text(t) => {
+                                    progress.mark_activity("writing reply");
                                     text_buf.push_str(&t);
                                     if let Some(tx) = &buf_tx {
                                         let _ = tx.send(compose_display(
@@ -583,9 +954,11 @@ impl AdapterRouter {
                                     }
                                 }
                                 AcpEvent::Thinking => {
+                                    progress.mark_activity("thinking");
                                     reactions.set_thinking().await;
                                 }
                                 AcpEvent::ToolStart { id, title } if !title.is_empty() => {
+                                    progress.start_tool(&title);
                                     reactions.set_tool(&title).await;
                                     let title = sanitize_title(&title);
                                     if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
@@ -608,6 +981,7 @@ impl AdapterRouter {
                                     }
                                 }
                                 AcpEvent::ToolDone { id, title, status } => {
+                                    progress.finish_tool(&title, status != "completed");
                                     reactions.set_thinking().await;
                                     let new_state = if status == "completed" {
                                         ToolState::Completed
@@ -644,6 +1018,28 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done().await;
+                    if progress_config.any_activity_trace_enabled() {
+                        if let Some(summary) = activity_trace.poll_summary() {
+                            append_progress_log_update(
+                                &adapter,
+                                &thread_channel,
+                                &mut progress_log,
+                                summary,
+                                message_limit,
+                            ).await;
+                        }
+                    }
+                    if let Some(err) = response_error.as_deref() {
+                        progress.mark_error(err);
+                    } else {
+                        progress.mark_done();
+                    }
+                    if let Some(msg) = &progress_card_msg {
+                        let state = if response_error.is_some() { "error" } else { "done" };
+                        let _ = adapter
+                            .edit_message(msg, &render_progress_card(&progress, Some(state)))
+                            .await;
+                    }
                     // Stop the edit loop
                     drop(buf_tx);
 
@@ -729,10 +1125,23 @@ impl AdapterRouter {
                         }
                     }
 
-                    Ok(())
+                    Ok(PromptRunOutcome::from_abort(prompt_abort))
                 })
             })
-            .await
+            .await?;
+
+        if outcome.should_reset_session() {
+            match self.pool.reset_session(thread_key).await {
+                Ok(()) => {
+                    warn!(thread_key, abort = ?outcome.abort, "reset session after failed prompt")
+                }
+                Err(e) => {
+                    warn!(thread_key, abort = ?outcome.abort, error = %e, "failed to reset session after failed prompt")
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -873,6 +1282,125 @@ fn compose_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hard_timeout_outcome_requires_session_reset() {
+        assert!(PromptRunOutcome::from_abort(PromptAbort::HardTimeout).should_reset_session());
+        assert!(PromptRunOutcome::from_abort(PromptAbort::AgentDied).should_reset_session());
+        assert!(!PromptRunOutcome::from_abort(PromptAbort::None).should_reset_session());
+    }
+
+    #[test]
+    fn progress_card_renders_status_tool_counts_and_running_tool() {
+        let now = std::time::Instant::now();
+        let mut state = ProgressState::new();
+        state.started = now - std::time::Duration::from_secs(65);
+        state.last_activity = now - std::time::Duration::from_secs(7);
+        state.status = "running `cargo test`".into();
+        state.running_tool = Some("cargo test".into());
+        state.completed_tools = 2;
+        state.failed_tools = 1;
+
+        let card = render_progress_card(&state, None);
+
+        assert!(card.contains("📊 **Agent progress**"));
+        assert!(card.contains("Status: running `cargo test`"));
+        assert!(card.contains("Tools: ✅ 2 · ❌ 1"));
+        assert!(card.contains("Current: `cargo test`"));
+    }
+
+    #[test]
+    fn heartbeat_renders_elapsed_idle_and_status() {
+        let now = std::time::Instant::now();
+        let mut state = ProgressState::new();
+        state.started = now - std::time::Duration::from_secs(120);
+        state.last_activity = now - std::time::Duration::from_secs(30);
+        state.status = "thinking".into();
+
+        let heartbeat = render_heartbeat(&state);
+
+        assert_eq!(heartbeat, "⏳ 2m · idle 30s · thinking");
+    }
+
+    #[test]
+    fn heartbeat_formats_long_durations_as_hours_and_minutes() {
+        let now = std::time::Instant::now();
+        let mut state = ProgressState::new();
+        state.started = now - std::time::Duration::from_secs(70 * 60);
+        state.last_activity = now - std::time::Duration::from_secs((2 * 60 + 34) * 60);
+        state.status = "running long command".into();
+
+        let heartbeat = render_heartbeat(&state);
+
+        assert_eq!(heartbeat, "⏳ 1h10m · idle 2h34m · running long command");
+    }
+
+    #[test]
+    fn progress_log_appends_different_status_updates_to_existing_message() {
+        let first = "⏳ 1m · idle 1s · thinking";
+        let (page, part, new_msg) = append_progress_log_content(None, 0, first, 500);
+        assert!(new_msg);
+        assert_eq!(part, 1);
+        assert!(page.contains("⏳ **Progress updates**"));
+        assert!(page.contains(first));
+
+        let second = "⏳ 2m · idle 1s · running tests";
+        let (page, part, new_msg) = append_progress_log_content(Some(&page), part, second, 500);
+        assert!(!new_msg);
+        assert_eq!(part, 1);
+        assert!(page.contains(first));
+        assert!(page.contains(second));
+    }
+
+    #[test]
+    fn progress_log_replaces_repeated_heartbeat_with_same_status() {
+        let first = "⏳ 1m · idle 1s · running long command";
+        let (page, part, new_msg) = append_progress_log_content(None, 0, first, 500);
+        assert!(new_msg);
+
+        let second = "⏳ 2m · idle 1m · running long command";
+        let (page, part, new_msg) = append_progress_log_content(Some(&page), part, second, 500);
+
+        assert!(!new_msg);
+        assert_eq!(part, 1);
+        assert!(!page.contains(first));
+        assert!(page.contains(second));
+        assert_eq!(page.matches(" · idle ").count(), 1);
+    }
+
+    #[test]
+    fn progress_log_replaces_repeated_heartbeat_while_preserving_trace_lines() {
+        let first = "⏳ 1m · idle 1s · running long command";
+        let (page, part, _) = append_progress_log_content(None, 0, first, 500);
+        let trace = "• ran shell command";
+        let (page, part, new_msg) = append_progress_log_content(Some(&page), part, trace, 500);
+        assert!(!new_msg);
+
+        let second = "⏳ 2m · idle 1m · running long command";
+        let (page, part, new_msg) = append_progress_log_content(Some(&page), part, second, 500);
+
+        assert!(!new_msg);
+        assert_eq!(part, 1);
+        assert!(!page.contains(first));
+        assert!(page.contains(trace));
+        assert!(page.contains(second));
+        assert_eq!(page.matches(" · idle ").count(), 1);
+    }
+
+    #[test]
+    fn progress_log_rolls_over_when_message_limit_would_be_exceeded() {
+        let first = "⏳ Still working — elapsed 60s";
+        let (page, part, _) = append_progress_log_content(None, 0, first, 95);
+        let second = "⏳ Still working — elapsed 120s with a very long status that cannot fit";
+
+        let (next, next_part, new_msg) = append_progress_log_content(Some(&page), part, second, 95);
+
+        assert!(new_msg);
+        assert_eq!(next_part, 2);
+        assert!(next.contains("⏳ **Progress updates (part 2)**"));
+        assert!(!next.contains(first));
+        assert!(next.chars().count() <= 95);
+    }
 
     /// Compile-time regression guard: use_streaming() is a required trait method
     /// (no default). Any adapter that forgets to implement it will fail to compile.
