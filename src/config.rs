@@ -76,6 +76,8 @@ pub struct Config {
     #[serde(default)]
     pub reactions: ReactionsConfig,
     #[serde(default)]
+    pub progress: ProgressConfig,
+    #[serde(default)]
     pub stt: SttConfig,
     #[serde(default)]
     pub markdown: MarkdownConfig,
@@ -458,6 +460,26 @@ pub struct ReactionTiming {
     pub error_hold_ms: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgressConfig {
+    /// Enable Discord-visible long-running task progress. Default off to avoid
+    /// changing behavior for existing deployments.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Send one editable progress-card message per active turn.
+    #[serde(default = "default_true")]
+    pub card_enabled: bool,
+    /// Send periodic heartbeat messages while a turn is still running.
+    #[serde(default = "default_true")]
+    pub heartbeat_enabled: bool,
+    /// How often to edit the progress card.
+    #[serde(default = "default_progress_card_update_secs")]
+    pub card_update_secs: u64,
+    /// How often to emit heartbeat messages.
+    #[serde(default = "default_progress_heartbeat_secs")]
+    pub heartbeat_secs: u64,
+}
+
 // --- defaults ---
 
 fn default_working_dir() -> String {
@@ -516,6 +538,12 @@ fn default_done_hold_ms() -> u64 {
 fn default_error_hold_ms() -> u64 {
     2_500
 }
+fn default_progress_card_update_secs() -> u64 {
+    15
+}
+fn default_progress_heartbeat_secs() -> u64 {
+    120
+}
 
 impl Default for PoolConfig {
     fn default() -> Self {
@@ -562,6 +590,18 @@ impl Default for ReactionTiming {
             stall_hard_ms: default_stall_hard_ms(),
             done_hold_ms: default_done_hold_ms(),
             error_hold_ms: default_error_hold_ms(),
+        }
+    }
+}
+
+impl Default for ProgressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            card_enabled: true,
+            heartbeat_enabled: true,
+            card_update_secs: default_progress_card_update_secs(),
+            heartbeat_secs: default_progress_heartbeat_secs(),
         }
     }
 }

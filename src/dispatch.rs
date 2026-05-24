@@ -1071,6 +1071,7 @@ mod tests {
         let router = Arc::new(AdapterRouter::new(
             pool,
             crate::config::ReactionsConfig::default(),
+            crate::config::ProgressConfig::default(),
             crate::markdown::TableMode::Off,
             crate::config::default_prompt_hard_timeout_secs(),
             crate::config::default_liveness_check_secs(),
