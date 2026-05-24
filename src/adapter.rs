@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
+use crate::claude_trace::ClaudeActivityTrace;
 use crate::config::{ProgressConfig, ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
@@ -715,6 +716,7 @@ impl AdapterRouter {
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
                     let mut progress = ProgressState::new();
                     let mut progress_log = ProgressLogState::default();
+                    let mut claude_trace = ClaudeActivityTrace::disabled();
                     let progress_card_msg = if progress_config.enabled && progress_config.card_enabled {
                         adapter
                             .send_message(&thread_channel, &render_progress_card(&progress, None))
@@ -738,6 +740,9 @@ impl AdapterRouter {
                     liveness_interval.tick().await;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
+                    if progress_config.claude_jsonl_trace_enabled {
+                        claude_trace = ClaudeActivityTrace::new(conn.acp_session_id.as_deref());
+                    }
                     progress.mark_activity("thinking");
                     if let Some(msg) = &progress_card_msg {
                         let _ = adapter
@@ -822,6 +827,17 @@ impl AdapterRouter {
                                     render_heartbeat(&progress),
                                     message_limit,
                                 ).await;
+                                if progress_config.claude_jsonl_trace_enabled {
+                                    if let Some(summary) = claude_trace.poll_summary() {
+                                        append_progress_log_update(
+                                            &adapter,
+                                            &thread_channel,
+                                            &mut progress_log,
+                                            summary,
+                                            message_limit,
+                                        ).await;
+                                    }
+                                }
                                 continue;
                             }
                             _ = liveness_interval.tick() => {
@@ -937,6 +953,17 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done().await;
+                    if progress_config.claude_jsonl_trace_enabled {
+                        if let Some(summary) = claude_trace.poll_summary() {
+                            append_progress_log_update(
+                                &adapter,
+                                &thread_channel,
+                                &mut progress_log,
+                                summary,
+                                message_limit,
+                            ).await;
+                        }
+                    }
                     if let Some(err) = response_error.as_deref() {
                         progress.mark_error(err);
                     } else {

@@ -1,6 +1,7 @@
 mod acp;
 mod adapter;
 mod bot_turns;
+mod claude_trace;
 mod config;
 mod cron;
 mod discord;

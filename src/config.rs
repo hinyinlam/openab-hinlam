@@ -493,6 +493,10 @@ pub struct ProgressConfig {
     /// How often to emit heartbeat messages.
     #[serde(default = "default_progress_heartbeat_secs")]
     pub heartbeat_secs: u64,
+    /// Tail Claude Code's local JSONL transcript and append sanitized activity
+    /// summaries to the progress log. Default off; backend-specific enrichment.
+    #[serde(default)]
+    pub claude_jsonl_trace_enabled: bool,
 }
 
 // --- defaults ---
@@ -617,6 +621,7 @@ impl Default for ProgressConfig {
             heartbeat_enabled: true,
             card_update_secs: default_progress_card_update_secs(),
             heartbeat_secs: default_progress_heartbeat_secs(),
+            claude_jsonl_trace_enabled: false,
         }
     }
 }
