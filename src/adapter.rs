@@ -363,6 +363,28 @@ fn progress_secs(d: std::time::Duration) -> u64 {
     d.as_secs().max(1)
 }
 
+fn format_progress_duration(d: std::time::Duration) -> String {
+    let secs = progress_secs(d);
+    if secs < 60 {
+        return format!("{secs} {}", if secs == 1 { "sec" } else { "secs" });
+    }
+
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins} {}", if mins == 1 { "min" } else { "mins" });
+    }
+
+    let hrs = mins / 60;
+    let rem_mins = mins % 60;
+    let hrs_unit = if hrs == 1 { "hr" } else { "hrs" };
+    if rem_mins == 0 {
+        format!("{hrs} {hrs_unit}")
+    } else {
+        let mins_unit = if rem_mins == 1 { "min" } else { "mins" };
+        format!("{hrs} {hrs_unit} {rem_mins} {mins_unit}")
+    }
+}
+
 fn render_progress_card(state: &ProgressState, final_state: Option<&str>) -> String {
     let elapsed = progress_secs(state.started.elapsed());
     let idle = progress_secs(state.last_activity.elapsed());
@@ -379,10 +401,10 @@ fn render_progress_card(state: &ProgressState, final_state: Option<&str>) -> Str
 }
 
 fn render_heartbeat(state: &ProgressState) -> String {
-    let elapsed = progress_secs(state.started.elapsed());
-    let idle = progress_secs(state.last_activity.elapsed());
+    let elapsed = format_progress_duration(state.started.elapsed());
+    let idle = format_progress_duration(state.last_activity.elapsed());
     format!(
-        "⏳ Still working — elapsed {elapsed}s, last activity {idle}s ago. Status: {}",
+        "⏳ Still working — elapsed {elapsed}, last activity {idle} ago. Status: {}",
         state.status
     )
 }
@@ -1297,9 +1319,24 @@ mod tests {
         let heartbeat = render_heartbeat(&state);
 
         assert!(heartbeat.contains("⏳ Still working"));
-        assert!(heartbeat.contains("elapsed 120s"));
-        assert!(heartbeat.contains("last activity 30s ago"));
+        assert!(heartbeat.contains("elapsed 2 mins"));
+        assert!(heartbeat.contains("last activity 30 secs ago"));
         assert!(heartbeat.contains("Status: thinking"));
+    }
+
+    #[test]
+    fn heartbeat_formats_long_durations_as_hours_and_minutes() {
+        let now = std::time::Instant::now();
+        let mut state = ProgressState::new();
+        state.started = now - std::time::Duration::from_secs(70 * 60);
+        state.last_activity = now - std::time::Duration::from_secs((2 * 60 + 34) * 60);
+        state.status = "running long command".into();
+
+        let heartbeat = render_heartbeat(&state);
+
+        assert!(heartbeat.contains("elapsed 1 hr 10 mins"));
+        assert!(heartbeat.contains("last activity 2 hrs 34 mins ago"));
+        assert!(heartbeat.contains("Status: running long command"));
     }
 
     #[test]
