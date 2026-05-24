@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::claude_trace::ClaudeActivityTrace;
+use crate::claude_trace::ActivityTrace;
 use crate::config::{ProgressConfig, ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
@@ -423,6 +423,36 @@ fn progress_log_page(part: usize, update: &str, message_limit: usize) -> String 
     )
 }
 
+fn progress_update_replace_key(update: &str) -> Option<String> {
+    const HEARTBEAT_PREFIX: &str = "⏳ Still working —";
+    const STATUS_MARKER: &str = ". Status: ";
+
+    if !update.starts_with(HEARTBEAT_PREFIX) {
+        return None;
+    }
+
+    let status = update.rsplit_once(STATUS_MARKER)?.1.trim();
+    if status.is_empty() {
+        None
+    } else {
+        Some(format!("heartbeat:{status}"))
+    }
+}
+
+fn progress_log_line_replace_key(line: &str) -> Option<String> {
+    progress_update_replace_key(line)
+}
+
+fn replace_progress_log_line(current: &str, replace_key: &str, update: &str) -> Option<String> {
+    let mut lines: Vec<&str> = current.lines().collect();
+    let line_index = lines.iter().enumerate().rev().find_map(|(idx, line)| {
+        (progress_log_line_replace_key(line).as_deref() == Some(replace_key)).then_some(idx)
+    })?;
+
+    lines[line_index] = update;
+    Some(lines.join("\n"))
+}
+
 fn append_progress_log_content(
     current_content: Option<&str>,
     current_part: usize,
@@ -430,6 +460,14 @@ fn append_progress_log_content(
     message_limit: usize,
 ) -> (String, usize, bool) {
     if let Some(current) = current_content {
+        if let Some(replace_key) = progress_update_replace_key(update) {
+            if let Some(candidate) = replace_progress_log_line(current, &replace_key, update) {
+                if candidate.chars().count() <= message_limit {
+                    return (candidate, current_part.max(1), false);
+                }
+            }
+        }
+
         let candidate = format!(
             "{current}
 {update}"
@@ -716,7 +754,7 @@ impl AdapterRouter {
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
                     let mut progress = ProgressState::new();
                     let mut progress_log = ProgressLogState::default();
-                    let mut claude_trace = ClaudeActivityTrace::disabled();
+                    let mut activity_trace = ActivityTrace::disabled();
                     let progress_card_msg = if progress_config.enabled && progress_config.card_enabled {
                         adapter
                             .send_message(&thread_channel, &render_progress_card(&progress, None))
@@ -740,8 +778,12 @@ impl AdapterRouter {
                     liveness_interval.tick().await;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
-                    if progress_config.claude_jsonl_trace_enabled {
-                        claude_trace = ClaudeActivityTrace::new(conn.acp_session_id.as_deref());
+                    if progress_config.any_activity_trace_enabled() {
+                        activity_trace = ActivityTrace::new(
+                            conn.acp_session_id.as_deref(),
+                            progress_config.claude_activity_trace_enabled(),
+                            progress_config.codex_activity_trace_enabled(),
+                        );
                     }
                     progress.mark_activity("thinking");
                     if let Some(msg) = &progress_card_msg {
@@ -827,8 +869,8 @@ impl AdapterRouter {
                                     render_heartbeat(&progress),
                                     message_limit,
                                 ).await;
-                                if progress_config.claude_jsonl_trace_enabled {
-                                    if let Some(summary) = claude_trace.poll_summary() {
+                                if progress_config.any_activity_trace_enabled() {
+                                    if let Some(summary) = activity_trace.poll_summary() {
                                         append_progress_log_update(
                                             &adapter,
                                             &thread_channel,
@@ -953,8 +995,8 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done().await;
-                    if progress_config.claude_jsonl_trace_enabled {
-                        if let Some(summary) = claude_trace.poll_summary() {
+                    if progress_config.any_activity_trace_enabled() {
+                        if let Some(summary) = activity_trace.poll_summary() {
                             append_progress_log_update(
                                 &adapter,
                                 &thread_channel,
@@ -1261,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_log_appends_updates_to_existing_message() {
+    fn progress_log_appends_different_status_updates_to_existing_message() {
         let first = "⏳ Still working — elapsed 60s, last activity 1s ago. Status: thinking";
         let (page, part, new_msg) = append_progress_log_content(None, 0, first, 500);
         assert!(new_msg);
@@ -1275,6 +1317,45 @@ mod tests {
         assert_eq!(part, 1);
         assert!(page.contains(first));
         assert!(page.contains(second));
+    }
+
+    #[test]
+    fn progress_log_replaces_repeated_heartbeat_with_same_status() {
+        let first =
+            "⏳ Still working — elapsed 60s, last activity 1s ago. Status: running long command";
+        let (page, part, new_msg) = append_progress_log_content(None, 0, first, 500);
+        assert!(new_msg);
+
+        let second =
+            "⏳ Still working — elapsed 120s, last activity 61s ago. Status: running long command";
+        let (page, part, new_msg) = append_progress_log_content(Some(&page), part, second, 500);
+
+        assert!(!new_msg);
+        assert_eq!(part, 1);
+        assert!(!page.contains(first));
+        assert!(page.contains(second));
+        assert_eq!(page.matches("⏳ Still working").count(), 1);
+    }
+
+    #[test]
+    fn progress_log_replaces_repeated_heartbeat_while_preserving_trace_lines() {
+        let first =
+            "⏳ Still working — elapsed 60s, last activity 1s ago. Status: running long command";
+        let (page, part, _) = append_progress_log_content(None, 0, first, 500);
+        let trace = "• ran shell command";
+        let (page, part, new_msg) = append_progress_log_content(Some(&page), part, trace, 500);
+        assert!(!new_msg);
+
+        let second =
+            "⏳ Still working — elapsed 120s, last activity 61s ago. Status: running long command";
+        let (page, part, new_msg) = append_progress_log_content(Some(&page), part, second, 500);
+
+        assert!(!new_msg);
+        assert_eq!(part, 1);
+        assert!(!page.contains(first));
+        assert!(page.contains(trace));
+        assert!(page.contains(second));
+        assert_eq!(page.matches("⏳ Still working").count(), 1);
     }
 
     #[test]

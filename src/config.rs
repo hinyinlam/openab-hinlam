@@ -493,10 +493,33 @@ pub struct ProgressConfig {
     /// How often to emit heartbeat messages.
     #[serde(default = "default_progress_heartbeat_secs")]
     pub heartbeat_secs: u64,
-    /// Tail Claude Code's local JSONL transcript and append sanitized activity
+    /// Tail supported local activity transcripts and append sanitized activity
     /// summaries to the progress log. Default off; backend-specific enrichment.
     #[serde(default)]
+    pub activity_trace_enabled: bool,
+    /// Tail Claude Code's local JSONL transcript and append sanitized activity
+    /// summaries to the progress log. Backward-compatible alias for Claude-only
+    /// activity tracing.
+    #[serde(default)]
     pub claude_jsonl_trace_enabled: bool,
+    /// Tail Codex's local JSONL rollout transcript and append sanitized activity
+    /// summaries to the progress log. Default off; backend-specific enrichment.
+    #[serde(default)]
+    pub codex_jsonl_trace_enabled: bool,
+}
+
+impl ProgressConfig {
+    pub fn claude_activity_trace_enabled(&self) -> bool {
+        self.activity_trace_enabled || self.claude_jsonl_trace_enabled
+    }
+
+    pub fn codex_activity_trace_enabled(&self) -> bool {
+        self.activity_trace_enabled || self.codex_jsonl_trace_enabled
+    }
+
+    pub fn any_activity_trace_enabled(&self) -> bool {
+        self.claude_activity_trace_enabled() || self.codex_activity_trace_enabled()
+    }
 }
 
 // --- defaults ---
@@ -621,7 +644,9 @@ impl Default for ProgressConfig {
             heartbeat_enabled: true,
             card_update_secs: default_progress_card_update_secs(),
             heartbeat_secs: default_progress_heartbeat_secs(),
+            activity_trace_enabled: false,
             claude_jsonl_trace_enabled: false,
+            codex_jsonl_trace_enabled: false,
         }
     }
 }

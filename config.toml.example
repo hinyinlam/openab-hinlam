@@ -136,6 +136,16 @@ tables = "code"  # "code" (default) | "bullets" | "off"
                  # bullets: convert each row into bullet points (• Header: Value)
                  # off: pass through unchanged
 
+# [progress]
+# enabled = false                  # opt-in; preserves existing behavior by default
+# card_enabled = true
+# heartbeat_enabled = true
+# card_update_secs = 15
+# heartbeat_secs = 120
+# activity_trace_enabled = false   # tail supported local traces (Claude Code + Codex)
+# claude_jsonl_trace_enabled = false # backward-compatible Claude-only trace flag
+# codex_jsonl_trace_enabled = false  # Codex ~/.codex/sessions rollout JSONL trace flag
+
 [reactions]
 enabled = true
 remove_after_reply = false
