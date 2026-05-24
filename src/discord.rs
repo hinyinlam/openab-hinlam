@@ -9,16 +9,18 @@ use crate::remind::{self, ReminderStore};
 use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
-    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage,
-    GetMessages,
+    CreateForumPost, CreateInteractionResponse, CreateInteractionResponseFollowup,
+    CreateInteractionResponseMessage, CreateMessage, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, CreateThread, EditMessage, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
 use serenity::model::application::{
     Command, CommandOptionType, ComponentInteractionDataKind, Interaction,
 };
-use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
+use serenity::model::channel::{
+    AutoArchiveDuration, ChannelType, Message, MessageType, ReactionType,
+};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
@@ -839,7 +841,20 @@ impl EventHandler for Handler {
                 thread_parent_id.as_deref(),
                 &msg.id.to_string(),
             );
-            thread_channel = routed_home_channel(&thread_channel, home_channel_id);
+            thread_channel = match routed_home_channel(
+                &ctx,
+                &thread_channel,
+                home_channel_id,
+                &prompt,
+            )
+            .await
+            {
+                Ok(ch) => ch,
+                Err(e) => {
+                    tracing::warn!(error = %e, home_channel_id, "failed to prepare home/seat destination; falling back to raw home channel");
+                    raw_home_channel(&thread_channel, home_channel_id)
+                }
+            };
         }
 
         // Notify user if any images couldn't be processed.
@@ -2269,13 +2284,69 @@ fn is_collaboration_source(
             .is_some_and(|id| collaboration_channels.contains(&id))
 }
 
-fn routed_home_channel(source: &ChannelRef, home_channel_id: u64) -> ChannelRef {
+fn raw_home_channel(source: &ChannelRef, home_channel_id: u64) -> ChannelRef {
     ChannelRef {
         platform: "discord".into(),
         channel_id: home_channel_id.to_string(),
         thread_id: None,
         parent_id: source.parent_id.clone(),
         origin_event_id: source.origin_event_id.clone(),
+    }
+}
+
+async fn routed_home_channel(
+    ctx: &Context,
+    source: &ChannelRef,
+    home_channel_id: u64,
+    prompt: &str,
+) -> anyhow::Result<ChannelRef> {
+    let channel_id = ChannelId::new(home_channel_id);
+    let channel = channel_id.to_channel(&ctx.http).await?;
+    if matches!(
+        channel,
+        serenity::model::channel::Channel::Guild(ref guild_channel)
+            if guild_channel.kind == ChannelType::Forum
+    ) {
+        let first_line = prompt
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("OpenAB routed work");
+        let safe_title = forum_post_title(first_line);
+        let post = channel_id
+            .create_forum_post(
+                &ctx.http,
+                CreateForumPost::new(
+                    safe_title,
+                    CreateMessage::new().content("📥 Routed work received from the meeting room. Progress and final output will continue in this office-seat post."),
+                )
+                .auto_archive_duration(AutoArchiveDuration::OneDay),
+            )
+            .await?;
+        Ok(ChannelRef {
+            platform: "discord".into(),
+            channel_id: post.id.to_string(),
+            thread_id: None,
+            parent_id: Some(home_channel_id.to_string()),
+            origin_event_id: source.origin_event_id.clone(),
+        })
+    } else {
+        Ok(raw_home_channel(source, home_channel_id))
+    }
+}
+
+fn forum_post_title(prompt: &str) -> String {
+    let mut title = prompt
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.len() > 80 {
+        title.truncate(80);
+    }
+    if title.len() < 2 {
+        "OpenAB routed work".to_string()
+    } else {
+        title
     }
 }
 
@@ -3153,7 +3224,7 @@ mod tests {
             parent_id: Some("1507727920926425208".into()),
             origin_event_id: None,
         };
-        let routed = routed_home_channel(&source, 1507720307044257823);
+        let routed = raw_home_channel(&source, 1507720307044257823);
 
         assert_eq!(routed.platform, "discord");
         assert_eq!(routed.channel_id, "1507720307044257823");
