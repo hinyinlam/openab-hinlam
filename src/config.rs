@@ -180,6 +180,12 @@ pub struct DiscordConfig {
     pub collaboration_channels: Vec<String>,
     /// Bot-specific home/seat channel for routed collaboration work.
     pub home_channel_id: Option<String>,
+    /// Short bot label for routed office-seat thread titles, e.g. "DRA".
+    pub bot_short: Option<String>,
+    /// Template for routed office-seat thread titles. Supported placeholders:
+    /// {bot_name}, {bot_short}, {source_thread_title}, {source_forum_name},
+    /// {source_message_summary}, {source_message_id}.
+    pub routed_thread_title: Option<String>,
     /// Route work mentioned in collaboration channels to `home_channel_id`.
     /// Default false to preserve existing same-channel behavior.
     #[serde(default)]

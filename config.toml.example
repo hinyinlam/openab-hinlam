@@ -18,6 +18,13 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
                                      # "mentions" = always require @mention
 # allow_dm = false                     # true = respond to Discord DMs; false (default) = ignore DMs
                                        # allowed_users still applies in DMs
+# collaboration_channels = []          # shared meeting-room channels/forum parents
+# home_channel_id = ""                  # bot-specific seat channel/forum for routed work
+# route_collaboration_to_home = false   # route mentions from collaboration_channels to home_channel_id
+# bot_short = "BOT"                     # short label for routed office-seat titles
+# routed_thread_title = "{bot_short} ← {source_thread_title}"
+#                                       # placeholders: {bot_name}, {bot_short}, {source_thread_title},
+#                                       # {source_forum_name}, {source_message_summary}, {source_message_id}
 
 # [slack]
 # bot_token = "${SLACK_BOT_TOKEN}"     # Bot User OAuth Token (xoxb-...)

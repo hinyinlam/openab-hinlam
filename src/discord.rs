@@ -233,6 +233,10 @@ pub struct Handler {
     pub route_collaboration_to_home: bool,
     /// Post a short acknowledgement in the source meeting room when routing.
     pub collaboration_ack: bool,
+    /// Short bot label for routed office-seat thread titles, e.g. "DRA".
+    pub bot_short: Option<String>,
+    /// Template for routed office-seat thread titles.
+    pub routed_thread_title: Option<String>,
 }
 
 impl Handler {
@@ -835,6 +839,22 @@ impl EventHandler for Handler {
                     tracing::warn!(error = %e, "failed to send collaboration routing acknowledgement");
                 }
             }
+            let source_thread_title = discord_channel_name(&ctx, msg.channel_id).await;
+            let source_forum_name = match thread_parent_id
+                .as_deref()
+                .and_then(|id| id.parse::<u64>().ok())
+            {
+                Some(parent_id) => discord_channel_name(&ctx, ChannelId::new(parent_id)).await,
+                None => None,
+            };
+            let seat_title = routed_thread_title(
+                self.routed_thread_title.as_deref(),
+                self.bot_short.as_deref(),
+                source_thread_title.as_deref(),
+                source_forum_name.as_deref(),
+                Some(msg.id.to_string().as_str()),
+                &prompt,
+            );
             prompt = annotate_routed_prompt(
                 &prompt,
                 &msg.channel_id.get().to_string(),
@@ -845,7 +865,7 @@ impl EventHandler for Handler {
                 &ctx,
                 &thread_channel,
                 home_channel_id,
-                &prompt,
+                &seat_title,
             )
             .await
             {
@@ -2298,7 +2318,7 @@ async fn routed_home_channel(
     ctx: &Context,
     source: &ChannelRef,
     home_channel_id: u64,
-    prompt: &str,
+    title: &str,
 ) -> anyhow::Result<ChannelRef> {
     let channel_id = ChannelId::new(home_channel_id);
     let channel = channel_id.to_channel(&ctx.http).await?;
@@ -2307,11 +2327,7 @@ async fn routed_home_channel(
         serenity::model::channel::Channel::Guild(ref guild_channel)
             if guild_channel.kind == ChannelType::Forum
     ) {
-        let first_line = prompt
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("OpenAB routed work");
-        let safe_title = forum_post_title(first_line);
+        let safe_title = forum_post_title(title);
         let post = channel_id
             .create_forum_post(
                 &ctx.http,
@@ -2347,6 +2363,65 @@ fn forum_post_title(prompt: &str) -> String {
         "OpenAB routed work".to_string()
     } else {
         title
+    }
+}
+
+async fn discord_channel_name(ctx: &Context, channel_id: ChannelId) -> Option<String> {
+    match channel_id.to_channel(&ctx.http).await.ok()? {
+        serenity::model::channel::Channel::Guild(guild_channel) => Some(guild_channel.name),
+        _ => None,
+    }
+}
+
+fn routed_thread_title(
+    template: Option<&str>,
+    bot_short: Option<&str>,
+    source_thread_title: Option<&str>,
+    source_forum_name: Option<&str>,
+    source_message_id: Option<&str>,
+    source_message_summary: &str,
+) -> String {
+    let summary = routed_source_message_summary(source_message_summary);
+    let source_title = source_thread_title
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(summary.as_str());
+    let template = template.unwrap_or("{bot_short} ← {source_thread_title}");
+    let mut title = template
+        .replace("{bot_short}", bot_short.unwrap_or(""))
+        .replace("{bot_name}", bot_short.unwrap_or(""))
+        .replace("{source_thread_title}", source_title)
+        .replace("{source_forum_name}", source_forum_name.unwrap_or(""))
+        .replace("{source_message_summary}", &summary)
+        .replace("{source_message_id}", source_message_id.unwrap_or(""));
+    title = title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|ch: char| ch == '←' || ch == '-' || ch == '|' || ch.is_whitespace())
+        .to_string();
+    if title.len() < 2 {
+        title = source_title.to_string();
+    }
+    forum_post_title(&title)
+}
+
+fn routed_source_message_summary(prompt: &str) -> String {
+    let mut words: Vec<&str> = prompt
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(prompt)
+        .split_whitespace()
+        .collect();
+    while words.first().is_some_and(|word| {
+        (word.starts_with("<@") && word.ends_with('>')) || word.starts_with('@')
+    }) {
+        words.remove(0);
+    }
+    let summary = words.join(" ");
+    if summary.trim().is_empty() {
+        "OpenAB routed work".to_string()
+    } else {
+        forum_post_title(&summary)
     }
 }
 
@@ -2490,6 +2565,37 @@ mod tests {
     }
 
     // --- thread-race error detection ---
+
+    #[test]
+    fn routed_thread_title_template_uses_bot_short_and_source_title() {
+        let title = routed_thread_title(
+            Some("{bot_short} ← {source_thread_title}"),
+            Some("DRA"),
+            Some("AlgoBackTesting has some dependencies integration requirements"),
+            Some("product-integration"),
+            None,
+            "@DataReplyAlgoBot please continue the integration task",
+        );
+
+        assert_eq!(
+            title,
+            "DRA ← AlgoBackTesting has some dependencies integration requirements"
+        );
+    }
+
+    #[test]
+    fn routed_thread_title_falls_back_to_task_summary_without_source_title() {
+        let title = routed_thread_title(
+            Some("{bot_short} ← {source_thread_title}"),
+            Some("MDB"),
+            None,
+            Some("product-integration"),
+            None,
+            "@MarketDataBuilderBot please verify the FRED downloader outputs",
+        );
+
+        assert_eq!(title, "MDB ← please verify the FRED downloader outputs");
+    }
 
     /// Detects the Discord error code for "thread already exists" (160004).
     #[test]

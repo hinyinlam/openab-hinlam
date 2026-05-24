@@ -458,6 +458,8 @@ async fn main() -> anyhow::Result<()> {
             home_channel_id,
             route_collaboration_to_home: discord_cfg.route_collaboration_to_home,
             collaboration_ack: discord_cfg.collaboration_ack,
+            bot_short: discord_cfg.bot_short.clone(),
+            routed_thread_title: discord_cfg.routed_thread_title.clone(),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
