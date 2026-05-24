@@ -223,6 +223,14 @@ pub struct Handler {
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Shared channels/forum parents used as low-noise collaboration meeting rooms.
+    pub collaboration_channels: HashSet<u64>,
+    /// Bot-specific home/seat channel for detailed routed work output.
+    pub home_channel_id: Option<u64>,
+    /// Route meeting-room mentions to `home_channel_id` when configured.
+    pub route_collaboration_to_home: bool,
+    /// Post a short acknowledgement in the source meeting room when routing.
+    pub collaboration_ack: bool,
 }
 
 impl Handler {
@@ -646,7 +654,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
+        let mut prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
 
         // No text and no attachments → skip
         if prompt.is_empty() && msg.attachments.is_empty() {
@@ -788,7 +796,7 @@ impl EventHandler for Handler {
             "processing"
         );
 
-        let thread_channel = if in_thread || is_dm {
+        let mut thread_channel = if in_thread || is_dm {
             // DMs use the DM channel directly (no threads in DMs).
             ChannelRef {
                 platform: "discord".into(),
@@ -806,6 +814,33 @@ impl EventHandler for Handler {
                 }
             }
         };
+
+        let routed_to_home = self.route_collaboration_to_home
+            && !is_dm
+            && is_collaboration_source(
+                channel_id,
+                thread_parent_id.as_deref(),
+                &self.collaboration_channels,
+            )
+            && self.home_channel_id.is_some();
+        if routed_to_home {
+            let home_channel_id = self.home_channel_id.expect("checked is_some");
+            if self.collaboration_ack {
+                let ack = format!(
+                    "📨 Routed detailed work to this bot's seat: <#{home_channel_id}>. Progress and final output will be posted there."
+                );
+                if let Err(e) = adapter.send_message(&thread_channel, &ack).await {
+                    tracing::warn!(error = %e, "failed to send collaboration routing acknowledgement");
+                }
+            }
+            prompt = annotate_routed_prompt(
+                &prompt,
+                &msg.channel_id.get().to_string(),
+                thread_parent_id.as_deref(),
+                &msg.id.to_string(),
+            );
+            thread_channel = routed_home_channel(&thread_channel, home_channel_id);
+        }
 
         // Notify user if any images couldn't be processed.
         if !failed_image_files.is_empty() {
@@ -836,7 +871,7 @@ impl EventHandler for Handler {
         // was built before the thread existed. Patch it so the agent sees
         // thread_id on the very first turn.
         let mut sender = sender;
-        if sender.thread_id.is_none() && thread_channel.parent_id.is_some() {
+        if !routed_to_home && sender.thread_id.is_none() && thread_channel.parent_id.is_some() {
             sender.thread_id = Some(thread_channel.channel_id.clone());
         }
 
@@ -2223,6 +2258,39 @@ fn should_skip_thread_creation(in_thread: bool, is_dm: bool) -> bool {
     in_thread || is_dm
 }
 
+fn is_collaboration_source(
+    channel_id: u64,
+    thread_parent_id: Option<&str>,
+    collaboration_channels: &HashSet<u64>,
+) -> bool {
+    collaboration_channels.contains(&channel_id)
+        || thread_parent_id
+            .and_then(|id| id.parse::<u64>().ok())
+            .is_some_and(|id| collaboration_channels.contains(&id))
+}
+
+fn routed_home_channel(source: &ChannelRef, home_channel_id: u64) -> ChannelRef {
+    ChannelRef {
+        platform: "discord".into(),
+        channel_id: home_channel_id.to_string(),
+        thread_id: None,
+        parent_id: source.parent_id.clone(),
+        origin_event_id: source.origin_event_id.clone(),
+    }
+}
+
+fn annotate_routed_prompt(
+    prompt: &str,
+    source_channel_id: &str,
+    source_parent_id: Option<&str>,
+    source_message_id: &str,
+) -> String {
+    format!(
+        "[Routed work item from Discord collaboration space]\nsource_channel_id: {source_channel_id}\nsource_parent_id: {}\nsource_message_id: {source_message_id}\n\nTask:\n{prompt}",
+        source_parent_id.unwrap_or("none"),
+    )
+}
+
 /// Pure decision function: should this message be processed or ignored?
 /// Returns `true` if the message should be processed (bot responds).
 /// Extracted from the EventHandler::message gating logic for testability.
@@ -3052,6 +3120,61 @@ mod tests {
     #[test]
     fn normal_channel_creates_thread() {
         assert!(!should_skip_thread_creation(false, false));
+    }
+
+    #[test]
+    fn collaboration_source_matches_forum_parent_thread() {
+        let collaboration_channels = HashSet::from([1507727920926425208]);
+
+        assert!(is_collaboration_source(
+            1508000000000000000,
+            Some("1507727920926425208"),
+            &collaboration_channels,
+        ));
+    }
+
+    #[test]
+    fn collaboration_source_matches_plain_collaboration_channel() {
+        let collaboration_channels = HashSet::from([1507727920926425208]);
+
+        assert!(is_collaboration_source(
+            1507727920926425208,
+            None,
+            &collaboration_channels,
+        ));
+    }
+
+    #[test]
+    fn collaboration_routing_uses_home_channel_and_keeps_source_parent() {
+        let source = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "1508000000000000000".into(),
+            thread_id: None,
+            parent_id: Some("1507727920926425208".into()),
+            origin_event_id: None,
+        };
+        let routed = routed_home_channel(&source, 1507720307044257823);
+
+        assert_eq!(routed.platform, "discord");
+        assert_eq!(routed.channel_id, "1507720307044257823");
+        assert_eq!(routed.thread_id, None);
+        assert_eq!(routed.parent_id, Some("1507727920926425208".into()));
+    }
+
+    #[test]
+    fn routed_prompt_includes_source_metadata_and_task() {
+        let prompt = annotate_routed_prompt(
+            "please check this schema issue",
+            "1508000000000000000",
+            Some("1507727920926425208"),
+            "1509000000000000000",
+        );
+
+        assert!(prompt.contains("Routed work item from Discord collaboration space"));
+        assert!(prompt.contains("source_channel_id: 1508000000000000000"));
+        assert!(prompt.contains("source_parent_id: 1507727920926425208"));
+        assert!(prompt.contains("source_message_id: 1509000000000000000"));
+        assert!(prompt.contains("please check this schema issue"));
     }
 
     // --- WarnAndStop dedup tests (#530) ---

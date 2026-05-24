@@ -172,6 +172,21 @@ pub struct DiscordConfig {
     /// Default: false (opt-in). `allowed_users` still applies in DMs.
     #[serde(default)]
     pub allow_dm: bool,
+    /// Shared Discord channels/forum parents that act as collaboration meeting rooms.
+    /// When `route_collaboration_to_home` is true and `home_channel_id` is set,
+    /// mentions from these spaces are acknowledged in-place but detailed work is
+    /// dispatched to `home_channel_id`.
+    #[serde(default)]
+    pub collaboration_channels: Vec<String>,
+    /// Bot-specific home/seat channel for routed collaboration work.
+    pub home_channel_id: Option<String>,
+    /// Route work mentioned in collaboration channels to `home_channel_id`.
+    /// Default false to preserve existing same-channel behavior.
+    #[serde(default)]
+    pub route_collaboration_to_home: bool,
+    /// Post a short acknowledgement in the meeting room when routing to home.
+    #[serde(default = "default_true")]
+    pub collaboration_ack: bool,
     /// Message dispatch mode. Default: per-message (v0.8.2-beta.1 behaviour).
     #[serde(default)]
     pub message_processing_mode: MessageProcessingMode,
