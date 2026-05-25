@@ -259,6 +259,16 @@ pub trait ChatAdapter: Send + Sync + 'static {
         self.edit_message(msg, "\u{200b}").await
     }
 
+    /// Find this bot's existing live status card in `channel`, delete older duplicates,
+    /// and return the newest reusable card. Default: unsupported for this platform.
+    async fn reconcile_status_card(
+        &self,
+        _channel: &ChannelRef,
+        _title: &str,
+    ) -> Result<Option<MessageRef>> {
+        Ok(None)
+    }
+
     /// Whether this adapter should use streaming edit (true) or send-once (false).
     /// `other_bot_present` indicates if another bot has posted in the current thread.
     /// Streaming should be disabled in multi-bot threads to avoid edit interference.
@@ -410,6 +420,7 @@ struct StatusCardController {
     enabled: bool,
     channel_id: Option<String>,
     title: String,
+    dedupe_on_startup: bool,
     active: Arc<AtomicUsize>,
     message: Arc<tokio::sync::Mutex<Option<MessageRef>>>,
 }
@@ -423,6 +434,7 @@ impl StatusCardController {
                 .status_card_title
                 .clone()
                 .unwrap_or_else(|| "OpenAB bot".to_string()),
+            dedupe_on_startup: config.status_card_dedupe_on_startup,
             active: Arc::new(AtomicUsize::new(0)),
             message: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -446,6 +458,24 @@ impl StatusCardController {
     }
 
     async fn set_ready(&self, adapter: &Arc<dyn ChatAdapter>) {
+        if self.enabled && self.dedupe_on_startup {
+            if let Some(channel_id) = &self.channel_id {
+                let target = ChannelRef {
+                    platform: adapter.platform().to_string(),
+                    channel_id: channel_id.clone(),
+                    thread_id: None,
+                    parent_id: None,
+                    origin_event_id: None,
+                };
+                match adapter.reconcile_status_card(&target, &self.title).await {
+                    Ok(Some(msg)) => {
+                        *self.message.lock().await = Some(msg);
+                    }
+                    Ok(None) => {}
+                    Err(e) => warn!(error = ?e, "status card startup dedupe failed"),
+                }
+            }
+        }
         self.update(adapter, None, "ready", "Ready", None).await;
     }
 
@@ -536,6 +566,14 @@ impl StatusCardController {
     }
 }
 
+fn status_card_header(title: &str) -> String {
+    format!("## 🤖 {title} Live Status")
+}
+
+pub(crate) fn is_status_card_for_title(content: &str, title: &str) -> bool {
+    content.lines().next() == Some(status_card_header(title).as_str())
+}
+
 fn render_status_card(
     title: &str,
     state: &str,
@@ -556,7 +594,8 @@ fn render_status_card(
         .unwrap_or_default();
     let detail = detail.map(|d| format!("\n{d}")).unwrap_or_default();
     format!(
-        "## 🤖 {title} Live Status\n\n{emoji} **{label}** · {active} active · updated just now\n\n**Phase:** {phase}{source_line}{detail}\n\n`{phase} · {active} active`"
+        "{}\n\n{emoji} **{label}** · {active} active · updated just now\n\n**Phase:** {phase}{source_line}{detail}\n\n`{phase} · {active} active`",
+        status_card_header(title)
     )
 }
 
@@ -1558,6 +1597,8 @@ mod tests {
         assert!(out.contains("🟡 **Working** · 2 active"));
         assert!(out.contains("**Source:** <#1508305693810364517>"));
         assert!(out.contains("**Elapsed:** 3m"));
+        assert!(is_status_card_for_title(&out, "CodexBot"));
+        assert!(!is_status_card_for_title(&out, "ClaudeBot"));
     }
 
     #[test]

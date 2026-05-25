@@ -1,6 +1,8 @@
 use crate::acp::protocol::ConfigOption;
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{
+    is_status_card_for_title, AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext,
+};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
@@ -46,11 +48,22 @@ const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
 
 pub struct DiscordAdapter {
     http: Arc<Http>,
+    bot_user_id: Option<UserId>,
 }
 
 impl DiscordAdapter {
     pub fn new(http: Arc<Http>) -> Self {
-        Self { http }
+        Self {
+            http,
+            bot_user_id: None,
+        }
+    }
+
+    pub fn new_with_bot_user_id(http: Arc<Http>, bot_user_id: UserId) -> Self {
+        Self {
+            http,
+            bot_user_id: Some(bot_user_id),
+        }
     }
 
     /// Resolve the effective Discord channel ID from a ChannelRef.
@@ -134,6 +147,43 @@ impl ChatAdapter for DiscordAdapter {
             )
             .await?;
         Ok(())
+    }
+
+    async fn reconcile_status_card(
+        &self,
+        channel: &ChannelRef,
+        title: &str,
+    ) -> anyhow::Result<Option<MessageRef>> {
+        let Some(bot_user_id) = self.bot_user_id else {
+            return Ok(None);
+        };
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        let channel_id = ChannelId::new(ch_id);
+        let messages = channel_id
+            .messages(&self.http, GetMessages::new().limit(100))
+            .await?;
+        let mut matches: Vec<MessageRef> = messages
+            .into_iter()
+            .filter(|msg| {
+                msg.author.id == bot_user_id && is_status_card_for_title(&msg.content, title)
+            })
+            .map(|msg| MessageRef {
+                channel: channel.clone(),
+                message_id: msg.id.to_string(),
+            })
+            .collect();
+        let keep = matches.first().cloned();
+        for duplicate in matches.drain(1..) {
+            if let Err(e) = self.delete_message(&duplicate).await {
+                warn!(
+                    error = ?e,
+                    message_id = duplicate.message_id,
+                    title,
+                    "failed to delete duplicate status card"
+                );
+            }
+        }
+        Ok(keep)
     }
 
     fn use_streaming(&self, other_bot_present: bool) -> bool {
@@ -952,7 +1002,12 @@ impl EventHandler for Handler {
         info!(user = %ready.user.name, "discord bot connected");
         let adapter = self
             .adapter
-            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+            .get_or_init(|| {
+                Arc::new(DiscordAdapter::new_with_bot_user_id(
+                    ctx.http.clone(),
+                    ready.user.id,
+                ))
+            })
             .clone();
         self.router.set_status_card_ready(&adapter).await;
 

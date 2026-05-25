@@ -224,6 +224,7 @@ Long-running progress messages and optional bot-level live status cards. All fie
 | `claude_jsonl_trace_enabled` | bool | `false` | Enable Claude Code JSONL transcript summaries. |
 | `codex_jsonl_trace_enabled` | bool | `false` | Enable Codex rollout transcript summaries. |
 | `status_card_enabled` | bool | `false` | Post a bot-level live status card into `status_card_channel_id` and edit it in place on startup, active turns, and completion. |
+| `status_card_dedupe_on_startup` | bool | `true` | On startup, reuse the newest existing live status card from this bot in `status_card_channel_id` and delete older duplicate cards from the same bot. |
 | `status_card_channel_id` | string | — | Discord/Slack channel ID that receives this bot's live status card. Required when `status_card_enabled = true`. |
 | `status_card_title` | string | `"OpenAB bot"` | Display title shown at the top of the live status card. Set this per bot, e.g. `"CodexBot"`. |
 
@@ -232,6 +233,7 @@ Example:
 ```toml
 [progress]
 status_card_enabled = true
+status_card_dedupe_on_startup = true
 status_card_channel_id = "123456789012345678"
 status_card_title = "CodexBot"
 ```

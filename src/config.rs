@@ -516,6 +516,11 @@ pub struct ProgressConfig {
     /// in place as this bot starts, works on, and finishes turns. Default off.
     #[serde(default)]
     pub status_card_enabled: bool,
+    /// On startup, reuse the newest status card from this bot in the configured
+    /// status channel and delete older duplicates. Status cards are opt-in, so
+    /// dedupe is enabled by default once status cards are enabled.
+    #[serde(default = "default_true")]
+    pub status_card_dedupe_on_startup: bool,
     /// Destination channel ID for the bot-level live status card. Required when
     /// `status_card_enabled = true`.
     pub status_card_channel_id: Option<String>,
@@ -663,6 +668,7 @@ impl Default for ProgressConfig {
             claude_jsonl_trace_enabled: false,
             codex_jsonl_trace_enabled: false,
             status_card_enabled: false,
+            status_card_dedupe_on_startup: true,
             status_card_channel_id: None,
             status_card_title: None,
         }
@@ -961,6 +967,31 @@ command = "echo"
             cfg.discord.unwrap().message_processing_mode,
             MessageProcessingMode::Lane
         );
+    }
+
+    #[test]
+    fn progress_status_card_dedupe_defaults_true() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert!(cfg.progress.status_card_dedupe_on_startup);
+    }
+
+    #[test]
+    fn progress_status_card_dedupe_can_be_disabled() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+
+[progress]
+status_card_enabled = true
+status_card_dedupe_on_startup = false
+status_card_channel_id = "123"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.progress.status_card_enabled);
+        assert!(!cfg.progress.status_card_dedupe_on_startup);
     }
 
     // The legacy alias "batched" was removed: only per-message / per-thread / per-lane
