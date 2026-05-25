@@ -950,6 +950,11 @@ impl EventHandler for Handler {
 
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "discord bot connected");
+        let adapter = self
+            .adapter
+            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+            .clone();
+        self.router.set_status_card_ready(&adapter).await;
 
         // Build the shared command list once.
         let commands = vec![

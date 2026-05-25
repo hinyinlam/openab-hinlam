@@ -209,6 +209,35 @@ Fine-tune reaction timing behavior (milliseconds).
 
 ---
 
+## `[progress]`
+
+Long-running progress messages and optional bot-level live status cards. All fields are backward-compatible; visible progress remains opt-in unless explicitly enabled.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable per-turn progress card / heartbeat features. |
+| `card_enabled` | bool | `true` | When `enabled = true`, post one editable progress card in the active thread. |
+| `heartbeat_enabled` | bool | `true` | When `enabled = true`, post/edit heartbeat progress-log messages while a turn runs. |
+| `card_update_secs` | integer | `15` | Edit cadence for per-turn progress cards and bot status cards. |
+| `heartbeat_secs` | integer | `120` | Heartbeat cadence. |
+| `activity_trace_enabled` | bool | `false` | Enable supported backend transcript summaries in the progress log. |
+| `claude_jsonl_trace_enabled` | bool | `false` | Enable Claude Code JSONL transcript summaries. |
+| `codex_jsonl_trace_enabled` | bool | `false` | Enable Codex rollout transcript summaries. |
+| `status_card_enabled` | bool | `false` | Post a bot-level live status card into `status_card_channel_id` and edit it in place on startup, active turns, and completion. |
+| `status_card_channel_id` | string | — | Discord/Slack channel ID that receives this bot's live status card. Required when `status_card_enabled = true`. |
+| `status_card_title` | string | `"OpenAB bot"` | Display title shown at the top of the live status card. Set this per bot, e.g. `"CodexBot"`. |
+
+Example:
+
+```toml
+[progress]
+status_card_enabled = true
+status_card_channel_id = "123456789012345678"
+status_card_title = "CodexBot"
+```
+
+---
+
 ## `[stt]`
 
 Speech-to-text transcription for voice messages. Uses an OpenAI-compatible `/audio/transcriptions` endpoint.

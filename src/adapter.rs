@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{error, warn};
 
@@ -404,6 +405,176 @@ fn render_heartbeat(state: &ProgressState) -> String {
     format!("⏳ {elapsed} · idle {idle} · {}", state.status)
 }
 
+#[derive(Clone)]
+struct StatusCardController {
+    enabled: bool,
+    channel_id: Option<String>,
+    title: String,
+    active: Arc<AtomicUsize>,
+    message: Arc<tokio::sync::Mutex<Option<MessageRef>>>,
+}
+
+impl StatusCardController {
+    fn new(config: &ProgressConfig) -> Self {
+        Self {
+            enabled: config.status_card_enabled,
+            channel_id: config.status_card_channel_id.clone(),
+            title: config
+                .status_card_title
+                .clone()
+                .unwrap_or_else(|| "OpenAB bot".to_string()),
+            active: Arc::new(AtomicUsize::new(0)),
+            message: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    fn begin_turn(&self) -> usize {
+        self.active.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn finish_turn(&self) -> usize {
+        self.active
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                Some(count.saturating_sub(1))
+            })
+            .map(|previous| previous.saturating_sub(1))
+            .unwrap_or(0)
+    }
+
+    fn active_count(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    async fn set_ready(&self, adapter: &Arc<dyn ChatAdapter>) {
+        self.update(adapter, None, "ready", "Ready", None).await;
+    }
+
+    async fn update_progress(
+        &self,
+        adapter: &Arc<dyn ChatAdapter>,
+        source: &ChannelRef,
+        state: &ProgressState,
+    ) {
+        let elapsed = format_progress_duration(state.started.elapsed());
+        let idle = format_progress_duration(state.last_activity.elapsed());
+        let detail = format!(
+            "**Elapsed:** {elapsed}\n**Last activity:** {idle} ago\n**Tools:** ✅ {} · ❌ {}{}",
+            state.completed_tools,
+            state.failed_tools,
+            state
+                .running_tool
+                .as_ref()
+                .map(|tool| format!("\n**Current:** `{tool}`"))
+                .unwrap_or_default()
+        );
+        self.update(
+            adapter,
+            Some(source),
+            "working",
+            &state.status,
+            Some(&detail),
+        )
+        .await;
+    }
+
+    async fn update_final(
+        &self,
+        adapter: &Arc<dyn ChatAdapter>,
+        source: &ChannelRef,
+        phase: &str,
+        detail: Option<&str>,
+    ) {
+        self.update(adapter, Some(source), phase, phase, detail)
+            .await;
+    }
+
+    async fn update(
+        &self,
+        adapter: &Arc<dyn ChatAdapter>,
+        source: Option<&ChannelRef>,
+        state: &str,
+        phase: &str,
+        detail: Option<&str>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let Some(channel_id) = &self.channel_id else {
+            warn!(
+                "progress.status_card_enabled=true but progress.status_card_channel_id is not set"
+            );
+            return;
+        };
+        let target = ChannelRef {
+            platform: adapter.platform().to_string(),
+            channel_id: channel_id.clone(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let content = render_status_card(
+            &self.title,
+            state,
+            phase,
+            self.active_count(),
+            source,
+            detail,
+        );
+        let existing = { self.message.lock().await.clone() };
+        if let Some(msg) = existing {
+            match adapter.edit_message(&msg, &content).await {
+                Ok(()) => return,
+                Err(e) => warn!(error = ?e, "status card edit failed; sending a new status card"),
+            }
+        }
+        match adapter.send_message(&target, &content).await {
+            Ok(msg) => {
+                *self.message.lock().await = Some(msg);
+            }
+            Err(e) => warn!(error = ?e, channel_id, "status card send failed"),
+        }
+    }
+}
+
+fn render_status_card(
+    title: &str,
+    state: &str,
+    phase: &str,
+    active: usize,
+    source: Option<&ChannelRef>,
+    detail: Option<&str>,
+) -> String {
+    let (emoji, label) = match state {
+        "ready" => ("🟢", "Ready"),
+        "done" => ("🟢", "Done"),
+        "error" => ("🔴", "Needs attention"),
+        _ if active > 0 => ("🟡", "Working"),
+        _ => ("🟢", "Ready"),
+    };
+    let source_line = source
+        .map(|channel| format!("\n**Source:** {}", format_channel_pointer(channel)))
+        .unwrap_or_default();
+    let detail = detail.map(|d| format!("\n{d}")).unwrap_or_default();
+    format!(
+        "## 🤖 {title} Live Status\n\n{emoji} **{label}** · {active} active · updated just now\n\n**Phase:** {phase}{source_line}{detail}\n\n`{phase} · {active} active`"
+    )
+}
+
+fn format_channel_pointer(channel: &ChannelRef) -> String {
+    if channel.platform == "discord" {
+        format!(
+            "<#{}>",
+            channel.thread_id.as_deref().unwrap_or(&channel.channel_id)
+        )
+    } else {
+        channel
+            .thread_id
+            .as_ref()
+            .map(|thread| format!("{} / {thread}", channel.channel_id))
+            .unwrap_or_else(|| channel.channel_id.clone())
+    }
+}
+
 #[derive(Debug, Default)]
 struct ProgressLogState {
     current_msg: Option<MessageRef>,
@@ -566,6 +737,7 @@ pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
     progress_config: ProgressConfig,
+    status_card: StatusCardController,
     table_mode: TableMode,
     prompt_hard_timeout: std::time::Duration,
     /// Polling cadence for the recv-loop liveness check (#732).
@@ -593,6 +765,7 @@ impl AdapterRouter {
         Self {
             pool,
             reactions_config,
+            status_card: StatusCardController::new(&progress_config),
             progress_config,
             table_mode,
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
@@ -608,6 +781,11 @@ impl AdapterRouter {
     /// Access the reactions config (used by dispatch.rs).
     pub fn reactions_config(&self) -> &ReactionsConfig {
         &self.reactions_config
+    }
+
+    /// Publish/update this bot's startup/idle live status card, when configured.
+    pub async fn set_status_card_ready(&self, adapter: &Arc<dyn ChatAdapter>) {
+        self.status_card.set_ready(adapter).await;
     }
 
     /// Pack one arrival event into ContentBlocks. Per-arrival layout:
@@ -764,11 +942,18 @@ impl AdapterRouter {
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
         let progress_config = self.progress_config.clone();
+        let status_card = self.status_card.clone();
+        status_card.begin_turn();
+        let turn_adapter = adapter.clone();
+        let turn_thread_channel = thread_channel.clone();
 
-        let outcome = self
+        let outcome_result = self
             .pool
             .with_connection(thread_key, |conn| {
                 let content_blocks = content_blocks.clone();
+                let status_card = status_card.clone();
+                let adapter = turn_adapter.clone();
+                let thread_channel = turn_thread_channel.clone();
                 Box::pin(async move {
                     let reset = conn.session_reset;
                     conn.session_reset = false;
@@ -778,6 +963,7 @@ impl AdapterRouter {
                     let mut progress = ProgressState::new();
                     let mut progress_log = ProgressLogState::default();
                     let mut activity_trace = ActivityTrace::disabled();
+                    status_card.update_progress(&adapter, &thread_channel, &progress).await;
                     let progress_card_msg = if progress_config.enabled && progress_config.card_enabled {
                         adapter
                             .send_message(&thread_channel, &render_progress_card(&progress, None))
@@ -809,6 +995,7 @@ impl AdapterRouter {
                         );
                     }
                     progress.mark_activity("thinking");
+                    status_card.update_progress(&adapter, &thread_channel, &progress).await;
                     if let Some(msg) = &progress_card_msg {
                         let _ = adapter
                             .edit_message(msg, &render_progress_card(&progress, None))
@@ -876,7 +1063,8 @@ impl AdapterRouter {
                                 // Reader saw EOF and already drained pending; nothing to abandon.
                                 None => break,
                             },
-                            _ = progress_card_interval.tick(), if progress_config.enabled && progress_config.card_enabled && progress_card_msg.is_some() => {
+                            _ = progress_card_interval.tick(), if (progress_config.enabled && progress_config.card_enabled && progress_card_msg.is_some()) || progress_config.status_card_enabled => {
+                                status_card.update_progress(&adapter, &thread_channel, &progress).await;
                                 if let Some(msg) = &progress_card_msg {
                                     let _ = adapter
                                         .edit_message(msg, &render_progress_card(&progress, None))
@@ -1034,8 +1222,11 @@ impl AdapterRouter {
                     } else {
                         progress.mark_done();
                     }
+                    let state = if response_error.is_some() { "error" } else { "done" };
+                    status_card
+                        .update_final(&adapter, &thread_channel, state, Some(&render_progress_card(&progress, Some(state))))
+                        .await;
                     if let Some(msg) = &progress_card_msg {
-                        let state = if response_error.is_some() { "error" } else { "done" };
                         let _ = adapter
                             .edit_message(msg, &render_progress_card(&progress, Some(state)))
                             .await;
@@ -1128,7 +1319,18 @@ impl AdapterRouter {
                     Ok(PromptRunOutcome::from_abort(prompt_abort))
                 })
             })
-            .await?;
+            .await;
+
+        let remaining = status_card.finish_turn();
+        if let Err(err) = &outcome_result {
+            let detail = format!("⚠️ {err}");
+            status_card
+                .update_final(&adapter, &thread_channel, "error", Some(&detail))
+                .await;
+        } else if remaining == 0 {
+            status_card.set_ready(&adapter).await;
+        }
+        let outcome = outcome_result?;
 
         if outcome.should_reset_session() {
             match self.pool.reset_session(thread_key).await {
@@ -1333,6 +1535,29 @@ mod tests {
         let heartbeat = render_heartbeat(&state);
 
         assert_eq!(heartbeat, "⏳ 1h10m · idle 2h34m · running long command");
+    }
+
+    #[test]
+    fn status_card_renders_discord_thread_pointer() {
+        let channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "1508305693810364517".into(),
+            thread_id: None,
+            parent_id: Some("1505414604170465300".into()),
+            origin_event_id: None,
+        };
+        let out = render_status_card(
+            "CodexBot",
+            "working",
+            "running tests",
+            2,
+            Some(&channel),
+            Some("**Elapsed:** 3m"),
+        );
+        assert!(out.contains("## 🤖 CodexBot Live Status"));
+        assert!(out.contains("🟡 **Working** · 2 active"));
+        assert!(out.contains("**Source:** <#1508305693810364517>"));
+        assert!(out.contains("**Elapsed:** 3m"));
     }
 
     #[test]

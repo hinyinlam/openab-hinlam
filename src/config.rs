@@ -512,6 +512,15 @@ pub struct ProgressConfig {
     /// summaries to the progress log. Default off; backend-specific enrichment.
     #[serde(default)]
     pub codex_jsonl_trace_enabled: bool,
+    /// Post one bot-level live status card into a configured channel and edit it
+    /// in place as this bot starts, works on, and finishes turns. Default off.
+    #[serde(default)]
+    pub status_card_enabled: bool,
+    /// Destination channel ID for the bot-level live status card. Required when
+    /// `status_card_enabled = true`.
+    pub status_card_channel_id: Option<String>,
+    /// Optional display title for the status card. Defaults to "OpenAB bot".
+    pub status_card_title: Option<String>,
 }
 
 impl ProgressConfig {
@@ -653,6 +662,9 @@ impl Default for ProgressConfig {
             activity_trace_enabled: false,
             claude_jsonl_trace_enabled: false,
             codex_jsonl_trace_enabled: false,
+            status_card_enabled: false,
+            status_card_channel_id: None,
+            status_card_title: None,
         }
     }
 }
