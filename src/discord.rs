@@ -27,10 +27,12 @@ use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// Hard cap on consecutive bot messages in a channel or thread.
@@ -313,24 +315,65 @@ impl RoutedHomeStore {
     }
 
     fn persist(&self, mappings: &HashMap<String, String>) {
-        let data = match serde_json::to_string_pretty(mappings) {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(error = %e, "failed to serialize routed home thread mappings");
-                return;
-            }
-        };
         if let Some(parent) = self.path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 warn!(path = %parent.display(), error = %e, "failed to create routed home mapping directory");
                 return;
             }
         }
-        let tmp = self.path.with_extension("json.tmp");
+
+        let lock_path = self.path.with_extension("json.lock");
+        let lock_start = Instant::now();
+        let _lock = loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(file) => break Some(file),
+                Err(_e) if lock_start.elapsed() < Duration::from_secs(5) => {
+                    if let Ok(meta) = std::fs::metadata(&lock_path) {
+                        if let Ok(modified) = meta.modified() {
+                            if modified
+                                .elapsed()
+                                .map(|age| age > Duration::from_secs(30))
+                                .unwrap_or(false)
+                            {
+                                let _ = std::fs::remove_file(&lock_path);
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => {
+                    warn!(path = %lock_path.display(), error = %e, "failed to lock routed home mapping file; persisting without lock");
+                    break None;
+                }
+            }
+        };
+
+        let mut merged = std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<HashMap<String, String>>(&data).ok())
+            .unwrap_or_default();
+        merged.extend(mappings.clone());
+
+        let data = match serde_json::to_string_pretty(&merged) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(error = %e, "failed to serialize routed home thread mappings");
+                let _ = std::fs::remove_file(&lock_path);
+                return;
+            }
+        };
+        let tmp = self
+            .path
+            .with_extension(format!("json.{}.tmp", std::process::id()));
         if let Err(e) = std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.path))
         {
             warn!(path = %self.path.display(), error = %e, "failed to persist routed home thread mappings");
         }
+        let _ = std::fs::remove_file(&lock_path);
     }
 }
 
@@ -2832,6 +2875,30 @@ mod tests {
             reloaded.lookup(key).await,
             Some("target-thread".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn routed_home_store_merges_existing_file_mappings_on_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routed_home_threads.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"existing-key": "existing-thread"}).to_string(),
+        )
+        .unwrap();
+
+        let store = RoutedHomeStore::load(path.clone());
+        store
+            .insert_mapping("new-key".to_string(), "new-thread".to_string())
+            .await;
+
+        let persisted: HashMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            persisted.get("existing-key"),
+            Some(&"existing-thread".to_string())
+        );
+        assert_eq!(persisted.get("new-key"), Some(&"new-thread".to_string()));
     }
 
     #[tokio::test]
