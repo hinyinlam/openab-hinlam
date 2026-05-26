@@ -210,6 +210,13 @@ impl Adapter {
 
     fn handle_session_new(&mut self, id: u64) -> JsonRpcResponse {
         let session_id = Uuid::new_v4().to_string();
+        // Evict oldest sessions if at capacity (prevent unbounded growth)
+        const MAX_SESSIONS: usize = 64;
+        while self.sessions.len() >= MAX_SESSIONS {
+            if let Some(key) = self.sessions.keys().next().cloned() {
+                self.sessions.remove(&key);
+            }
+        }
         // Try to restore from persisted state
         let conversation_id = self.restore_session(&session_id);
         self.sessions.insert(
@@ -293,6 +300,21 @@ impl Adapter {
 
                 if !output.status.success() {
                     eprintln!("[agy-acp] WARN: agy exited with status: {}", output.status);
+                    if output.stdout.is_empty() {
+                        let msg = if stderr_text.is_empty() {
+                            format!("agy exited with status: {}", output.status)
+                        } else {
+                            format!("agy failed: {}", stderr_text.trim_end())
+                        };
+                        let resp = JsonRpcResponse {
+                            jsonrpc: "2.0",
+                            id,
+                            result: None,
+                            error: Some(json!({"code":-32000,"message":msg})),
+                        };
+                        output_lines.push(serde_json::to_string(&resp).unwrap());
+                        return output_lines;
+                    }
                 }
 
                 let full_text = String::from_utf8_lossy(&output.stdout).to_string();
