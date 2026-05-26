@@ -24,7 +24,7 @@ use serenity::model::channel::{
     AutoArchiveDuration, ChannelType, Message, MessageType, ReactionType,
 };
 use serenity::model::gateway::Ready;
-use serenity::model::id::{ChannelId, MessageId, UserId};
+use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -2577,10 +2577,25 @@ async fn routed_home_channel(
         serenity::model::channel::Channel::Guild(ref guild_channel)
             if guild_channel.kind == ChannelType::Forum
     ) {
+        let guild_id = match &channel {
+            serenity::model::channel::Channel::Guild(guild_channel) => guild_channel.guild_id,
+            _ => unreachable!("checked forum channel above"),
+        };
         let route_key = routed_home_route_key(home_channel_id, source);
         let home_thread_id = routed_home_store
             .get_or_create_mapping(route_key, || async {
                 let safe_title = forum_post_title(title);
+                if let Some(existing_thread_id) =
+                    find_forum_thread_by_title(ctx, guild_id, home_channel_id, &safe_title).await?
+                {
+                    info!(
+                        home_channel_id,
+                        title = %safe_title,
+                        thread_id = %existing_thread_id,
+                        "reusing existing routed home forum post by title"
+                    );
+                    return Ok(existing_thread_id);
+                }
                 let post = channel_id
                     .create_forum_post(
                         &ctx.http,
@@ -2601,6 +2616,44 @@ async fn routed_home_channel(
         ))
     } else {
         Ok(raw_home_channel(source, home_channel_id))
+    }
+}
+
+async fn find_forum_thread_by_title(
+    ctx: &Context,
+    guild_id: GuildId,
+    home_channel_id: u64,
+    title: &str,
+) -> anyhow::Result<Option<String>> {
+    let active = guild_id.get_active_threads(&ctx.http).await?;
+    if let Some(thread) = active.threads.into_iter().find(|thread| {
+        thread
+            .parent_id
+            .is_some_and(|parent| parent.get() == home_channel_id)
+            && thread.name == title
+    }) {
+        return Ok(Some(thread.id.to_string()));
+    }
+
+    let channel_id = ChannelId::new(home_channel_id);
+    match channel_id
+        .get_archived_public_threads(&ctx.http, None, Some(100))
+        .await
+    {
+        Ok(archived) => Ok(archived
+            .threads
+            .into_iter()
+            .find(|thread| thread.name == title)
+            .map(|thread| thread.id.to_string())),
+        Err(e) => {
+            warn!(
+                home_channel_id,
+                title,
+                error = %e,
+                "failed to search archived forum posts by title; creating a new post if no active match exists"
+            );
+            Ok(None)
+        }
     }
 }
 
