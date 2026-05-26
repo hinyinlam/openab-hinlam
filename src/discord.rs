@@ -1181,6 +1181,14 @@ impl EventHandler for Handler {
                         "Delay before firing (e.g. 30m, 2h, 1d)",
                     )
                     .required(true),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "reference",
+                        "Optional source-of-truth URL, e.g. an existing GitHub issue comment",
+                    )
+                    .required(false),
                 ),
             CreateCommand::new("export-thread")
                 .description("Download this thread as a text file")
@@ -1565,6 +1573,12 @@ impl Handler {
             .find(|o| o.name == "delay")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
+        let reference_raw = opts
+            .iter()
+            .find(|o| o.name == "reference")
+            .and_then(|o| o.value.as_str())
+            .unwrap_or("")
+            .trim();
 
         if targets_raw.is_empty() || message.is_empty() || delay_raw.is_empty() {
             let response = CreateInteractionResponse::Message(
@@ -1594,6 +1608,16 @@ impl Handler {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
                     .content(format!("⚠️ {e}"))
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        if let Err(e) = remind::validate_reference(reference_raw) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!("⚠️ Invalid reference: {e}"))
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -1654,6 +1678,7 @@ impl Handler {
             sender_id: cmd.user.id.get(),
             targets: targets.clone(),
             message: message.clone(),
+            reference: (!reference_raw.is_empty()).then(|| reference_raw.to_string()),
             fire_at,
             created_at: chrono::Utc::now(),
         };
@@ -1664,11 +1689,17 @@ impl Handler {
         remind::schedule_reminder(ctx.http.clone(), self.reminder_store.clone(), reminder);
 
         let delay_str = remind::format_delay(delay_secs);
+        let reference_hint = if reference_raw.is_empty() {
+            String::new()
+        } else {
+            format!("\nReference: {reference_raw}")
+        };
         let response = CreateInteractionResponse::Message(
             CreateInteractionResponseMessage::new()
                 .content(format!(
-                    "⏰ Reminder set! Will fire in **{delay_str}** and mention {}",
-                    targets.join(" ")
+                    "⏰ Reminder set! Will fire in **{delay_str}** and mention {}{}",
+                    targets.join(" "),
+                    reference_hint
                 ))
                 .ephemeral(true),
         );

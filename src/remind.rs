@@ -20,6 +20,11 @@ pub struct Reminder {
     /// Raw mention strings (e.g. "<@123>", "<@&456>")
     pub targets: Vec<String>,
     pub message: String,
+    /// Optional source-of-truth reference (for example, an existing GitHub
+    /// issue comment URL) that the assignee should answer instead of creating
+    /// duplicate issue comments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
     pub fire_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
@@ -96,6 +101,9 @@ impl ReminderStore {
 /// Maximum allowed message length for reminders.
 pub const MAX_MESSAGE_LEN: usize = 1800;
 
+/// Maximum allowed source reference length for reminders.
+pub const MAX_REFERENCE_LEN: usize = 512;
+
 /// Maximum number of mention targets per reminder.
 pub const MAX_TARGETS: usize = 10;
 
@@ -114,6 +122,25 @@ pub fn validate_message(msg: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Validate an optional reminder reference. References are intentionally
+/// generic URLs, but GitHub issue-comment URLs are the preferred way to point
+/// bots at an existing source-of-truth reply.
+pub fn validate_reference(reference: &str) -> Result<(), String> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Ok(());
+    }
+    if reference.len() > MAX_REFERENCE_LEN {
+        return Err(format!(
+            "reference too long (max {MAX_REFERENCE_LEN} characters)"
+        ));
+    }
+    if !(reference.starts_with("https://") || reference.starts_with("http://")) {
+        return Err("reference must be an http(s) URL".into());
+    }
+    Ok(())
 }
 
 /// Parse a human delay string like "30m", "2h", "7d" into seconds.
@@ -200,9 +227,14 @@ pub fn schedule_reminder(http: Arc<Http>, store: ReminderStore, reminder: Remind
         tokio::time::sleep(delay).await;
 
         let targets_str = reminder.targets.join(" ");
+        let reference_line = reminder
+            .reference
+            .as_deref()
+            .map(|reference| format!("\nReference: {reference}\nPlease reply to that existing reference instead of creating duplicate GitHub issue comments."))
+            .unwrap_or_default();
         let content = format!(
-            "⏰ **Reminder** from <@{}>:\n\"{}\"\ncc {}",
-            reminder.sender_id, reminder.message, targets_str
+            "⏰ **Reminder** from <@{}>:\n\"{}\"{}\ncc {}",
+            reminder.sender_id, reminder.message, reference_line, targets_str
         );
 
         let channel = ChannelId::new(reminder.channel_id);
@@ -335,6 +367,7 @@ mod tests {
             sender_id: 456,
             targets: vec!["<@789>".into()],
             message: "hello".into(),
+            reference: None,
             fire_at: Utc::now() + chrono::Duration::hours(1),
             created_at: Utc::now(),
         };
@@ -365,6 +398,10 @@ mod tests {
             sender_id: 200,
             targets: vec!["<@300>".into()],
             message: "persist test".into(),
+            reference: Some(
+                "https://github.com/hinyinlam/AlgoBackTesting/issues/1#issuecomment-4532803170"
+                    .into(),
+            ),
             fire_at: Utc::now() + chrono::Duration::hours(2),
             created_at: Utc::now(),
         };
@@ -376,6 +413,10 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "persist-1");
         assert_eq!(pending[0].message, "persist test");
+        assert_eq!(
+            pending[0].reference.as_deref(),
+            Some("https://github.com/hinyinlam/AlgoBackTesting/issues/1#issuecomment-4532803170")
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -411,6 +452,17 @@ mod tests {
     #[test]
     fn test_validate_message_too_long() {
         assert!(validate_message(&"a".repeat(1801)).is_err());
+    }
+
+    #[test]
+    fn test_validate_reference() {
+        assert!(validate_reference("").is_ok());
+        assert!(validate_reference(
+            "https://github.com/hinyinlam/AlgoBackTesting/issues/1#issuecomment-4532803170"
+        )
+        .is_ok());
+        assert!(validate_reference("ftp://example.com/nope").is_err());
+        assert!(validate_reference(&format!("https://{}", "a".repeat(600))).is_err());
     }
 
     #[test]
