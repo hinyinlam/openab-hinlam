@@ -424,12 +424,14 @@ async fn main() -> anyhow::Result<()> {
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
 
         // Initialize reminder store (persists to $HOME/.openab/reminders.json)
-        let reminder_path = std::env::var("HOME")
+        let openab_state_dir = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_default()
-            .join(".openab")
-            .join("reminders.json");
+            .join(".openab");
+        let reminder_path = openab_state_dir.join("reminders.json");
         let reminder_store = remind::ReminderStore::load(reminder_path);
+        let routed_home_store =
+            discord::RoutedHomeStore::load(openab_state_dir.join("routed_home_threads.json"));
 
         let handler = discord::Handler {
             router,
@@ -453,6 +455,7 @@ async fn main() -> anyhow::Result<()> {
             allow_dm: discord_cfg.allow_dm,
             dispatcher: discord_dispatcher,
             reminder_store: reminder_store.clone(),
+            routed_home_store,
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             collaboration_channels,
             home_channel_id,

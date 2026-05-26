@@ -27,6 +27,8 @@ use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, error, info, warn};
@@ -243,6 +245,95 @@ impl ChatAdapter for DiscordAdapter {
 
 // --- Handler: serenity EventHandler that delegates to AdapterRouter ---
 
+#[derive(Clone)]
+pub struct RoutedHomeStore {
+    mappings: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    creating: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    path: PathBuf,
+}
+
+impl RoutedHomeStore {
+    /// Load or create the source collaboration thread → routed home forum post mapping.
+    pub fn load(path: PathBuf) -> Self {
+        let mappings = match std::fs::read_to_string(&path) {
+            Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+                warn!(path = %path.display(), error = %e, "failed to parse routed_home_threads.json, starting empty");
+                HashMap::new()
+            }),
+            Err(_) => HashMap::new(),
+        };
+        info!(count = mappings.len(), path = %path.display(), "loaded routed home thread mappings");
+        Self {
+            mappings: Arc::new(tokio::sync::Mutex::new(mappings)),
+            creating: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            path,
+        }
+    }
+
+    async fn lookup(&self, key: &str) -> Option<String> {
+        self.mappings.lock().await.get(key).cloned()
+    }
+
+    async fn insert_mapping(&self, key: String, target_channel_id: String) {
+        let snapshot = {
+            let mut mappings = self.mappings.lock().await;
+            mappings.insert(key, target_channel_id);
+            mappings.clone()
+        };
+        self.persist(&snapshot);
+    }
+
+    async fn get_or_create_mapping<F, Fut>(&self, key: String, create: F) -> anyhow::Result<String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<String>>,
+    {
+        if let Some(existing) = self.lookup(&key).await {
+            return Ok(existing);
+        }
+
+        let gate = {
+            let mut creating = self.creating.lock().await;
+            creating
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = gate.lock().await;
+
+        if let Some(existing) = self.lookup(&key).await {
+            return Ok(existing);
+        }
+
+        let target_channel_id = create().await?;
+        self.insert_mapping(key.clone(), target_channel_id.clone())
+            .await;
+        self.creating.lock().await.remove(&key);
+        Ok(target_channel_id)
+    }
+
+    fn persist(&self, mappings: &HashMap<String, String>) {
+        let data = match serde_json::to_string_pretty(mappings) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(error = %e, "failed to serialize routed home thread mappings");
+                return;
+            }
+        };
+        if let Some(parent) = self.path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!(path = %parent.display(), error = %e, "failed to create routed home mapping directory");
+                return;
+            }
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.path))
+        {
+            warn!(path = %self.path.display(), error = %e, "failed to persist routed home thread mappings");
+        }
+    }
+}
+
 pub struct Handler {
     pub router: Arc<AdapterRouter>,
     pub allow_all_channels: bool,
@@ -273,6 +364,8 @@ pub struct Handler {
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
     /// Reminder store for /remind slash command.
     pub reminder_store: ReminderStore,
+    /// Source collaboration thread → routed home forum post mapping.
+    pub routed_home_store: RoutedHomeStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
     /// Shared channels/forum parents used as low-noise collaboration meeting rooms.
@@ -913,6 +1006,7 @@ impl EventHandler for Handler {
             );
             thread_channel = match routed_home_channel(
                 &ctx,
+                &self.routed_home_store,
                 &thread_channel,
                 home_channel_id,
                 &seat_title,
@@ -2374,8 +2468,30 @@ fn raw_home_channel(source: &ChannelRef, home_channel_id: u64) -> ChannelRef {
     }
 }
 
+fn routed_home_route_key(home_channel_id: u64, source: &ChannelRef) -> String {
+    format!(
+        "discord:routed_home:v1:{home_channel_id}:{}",
+        source.channel_id
+    )
+}
+
+fn mapped_routed_home_channel(
+    source: &ChannelRef,
+    home_channel_id: u64,
+    home_thread_id: &str,
+) -> ChannelRef {
+    ChannelRef {
+        platform: "discord".into(),
+        channel_id: home_thread_id.to_string(),
+        thread_id: None,
+        parent_id: Some(home_channel_id.to_string()),
+        origin_event_id: source.origin_event_id.clone(),
+    }
+}
+
 async fn routed_home_channel(
     ctx: &Context,
+    routed_home_store: &RoutedHomeStore,
     source: &ChannelRef,
     home_channel_id: u64,
     title: &str,
@@ -2387,24 +2503,28 @@ async fn routed_home_channel(
         serenity::model::channel::Channel::Guild(ref guild_channel)
             if guild_channel.kind == ChannelType::Forum
     ) {
-        let safe_title = forum_post_title(title);
-        let post = channel_id
-            .create_forum_post(
-                &ctx.http,
-                CreateForumPost::new(
-                    safe_title,
-                    CreateMessage::new().content("📥 Routed work received from the meeting room. Progress and final output will continue in this office-seat post."),
-                )
-                .auto_archive_duration(AutoArchiveDuration::OneDay),
-            )
+        let route_key = routed_home_route_key(home_channel_id, source);
+        let home_thread_id = routed_home_store
+            .get_or_create_mapping(route_key, || async {
+                let safe_title = forum_post_title(title);
+                let post = channel_id
+                    .create_forum_post(
+                        &ctx.http,
+                        CreateForumPost::new(
+                            safe_title,
+                            CreateMessage::new().content("📥 Routed work received from the meeting room. Progress and final output will continue in this office-seat post."),
+                        )
+                        .auto_archive_duration(AutoArchiveDuration::OneDay),
+                    )
+                    .await?;
+                Ok(post.id.to_string())
+            })
             .await?;
-        Ok(ChannelRef {
-            platform: "discord".into(),
-            channel_id: post.id.to_string(),
-            thread_id: None,
-            parent_id: Some(home_channel_id.to_string()),
-            origin_event_id: source.origin_event_id.clone(),
-        })
+        Ok(mapped_routed_home_channel(
+            source,
+            home_channel_id,
+            &home_thread_id,
+        ))
     } else {
         Ok(raw_home_channel(source, home_channel_id))
     }
@@ -2655,6 +2775,99 @@ mod tests {
         );
 
         assert_eq!(title, "MDB ← please verify the FRED downloader outputs");
+    }
+
+    #[test]
+    fn routed_home_route_key_reuses_source_thread_not_message_or_title() {
+        let source = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "1508301228592070718".into(),
+            thread_id: None,
+            parent_id: Some("1507727920926425208".into()),
+            origin_event_id: Some("message-a".into()),
+        };
+
+        let first = routed_home_route_key(1507720307044257823, &source);
+        let mut same_thread_different_event = source.clone();
+        same_thread_different_event.origin_event_id = Some("message-b".into());
+        let second = routed_home_route_key(1507720307044257823, &same_thread_different_event);
+
+        assert_eq!(first, second);
+        assert_ne!(first, routed_home_route_key(1507720411960578208, &source));
+    }
+
+    #[test]
+    fn mapped_routed_home_channel_points_to_existing_forum_post() {
+        let source = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "1508301228592070718".into(),
+            thread_id: None,
+            parent_id: Some("1507727920926425208".into()),
+            origin_event_id: Some("evt-123".into()),
+        };
+
+        let mapped =
+            mapped_routed_home_channel(&source, 1507720307044257823, "1508433084117291138");
+
+        assert_eq!(mapped.platform, "discord");
+        assert_eq!(mapped.channel_id, "1508433084117291138");
+        assert_eq!(mapped.thread_id, None);
+        assert_eq!(mapped.parent_id, Some("1507720307044257823".into()));
+        assert_eq!(mapped.origin_event_id, Some("evt-123".into()));
+    }
+
+    #[tokio::test]
+    async fn routed_home_store_persists_mappings_across_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routed_home_threads.json");
+        let store = RoutedHomeStore::load(path.clone());
+        let key = "discord:routed_home:v1:home:source";
+
+        store
+            .insert_mapping(key.to_string(), "target-thread".to_string())
+            .await;
+
+        let reloaded = RoutedHomeStore::load(path);
+        assert_eq!(
+            reloaded.lookup(key).await,
+            Some("target-thread".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_home_store_serializes_concurrent_same_key_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RoutedHomeStore::load(dir.path().join("routed_home_threads.json"));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let first_store = store.clone();
+        let first_attempts = attempts.clone();
+        let first = tokio::spawn(async move {
+            first_store
+                .get_or_create_mapping("same-key".to_string(), || async move {
+                    first_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<_, anyhow::Error>("target-thread".to_string())
+                })
+                .await
+        });
+
+        let second_store = store.clone();
+        let second_attempts = attempts.clone();
+        let second = tokio::spawn(async move {
+            second_store
+                .get_or_create_mapping("same-key".to_string(), || async move {
+                    second_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<_, anyhow::Error>("duplicate-target".to_string())
+                })
+                .await
+        });
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+
+        assert_eq!(first, second);
+        assert!(first == "target-thread" || first == "duplicate-target");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// Detects the Discord error code for "thread already exists" (160004).
