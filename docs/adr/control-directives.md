@@ -179,6 +179,31 @@ For multi-value keys (e.g., `[[label:a]] [[label:b]]`), a future revision may in
 2. Wire `[[lang:...]]` to system prompt language instruction
 3. Validation and fallback logic
 
+### Phase 3: `/new` Slash Command
+
+Platform-specific UX sugar that translates to control directives internally.
+
+```
+/new ws:~/projects/myapp model:claude-sonnet-4-20250514
+investigate the build failure
+```
+
+1. Register `/new` slash command on supported platforms (Discord, Slack)
+2. Command handler parses arguments into `[[key:value]]` directives
+3. Feeds through the same directive parser pipeline as inline directives
+4. Creates a new thread with the parsed session metadata
+
+**Why `/new`:**
+- Short, intuitive — matches "new session/thread" mental model
+- Platform autocomplete provides discoverability
+- Does not conflict with other bots' commands
+- Naturally implies "session start" — aligns with first-message-only rule
+
+**Relationship to inline directives:**
+- `/new` is a convenience layer; control directives remain the canonical spec
+- Users who prefer text-only (or are on platforms without slash commands) use `@Bot [[...]]` directly
+- Both paths produce identical `SessionMetadata`
+
 ---
 
 ## 7. Alternatives Considered
