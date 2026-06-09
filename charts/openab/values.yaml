@@ -143,6 +143,11 @@ agents:
     #   reactions:
     #     enabled: true
     #     removeAfterReply: false
+    #   # workspace.aliases: map alias names to paths for [[ws:@alias]] directives
+    #   workspace:
+    #     aliases:
+    #       myproject: "~/projects/myproject"
+    #       openab: "~/openab"
     #   persistence:
     #     enabled: true
     #     storageClass: ""
