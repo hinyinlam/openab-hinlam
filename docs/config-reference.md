@@ -21,7 +21,7 @@ openab run -c http://internal.example.com/config.toml
 
 Remote config is fetched via HTTP GET with a 10-second timeout and a 1 MiB response size limit. Environment variable expansion (`${VAR}`) works identically on both local and remote config content.
 
-> **Security best practice:** Never hardcode secrets in remote config files. Use environment variable references like `bot_token = "${DISCORD_BOT_TOKEN}"` and inject the actual values via local environment variables or Kubernetes Secrets. OpenAB expands `${VAR}` identically for both local and remote config.
+> **Security best practice:** Never hardcode secrets in remote config files. Use environment variable references like `bot_token = "${DISCORD_BOT_TOKEN}"` and inject the actual values via local environment variables or Kubernetes Secrets. For centralized secret management with rotation and audit, use `[secrets.refs]` with AWS Secrets Manager or an exec provider — see [secrets-management.md](secrets-management.md). OpenAB expands `${VAR}` identically for both local and remote config.
 
 ---
 
@@ -235,6 +235,57 @@ aws s3 sync "$HOME/" "s3://$STATE_BUCKET/$TASK_FAMILY/" \
 '''
 timeout_seconds = 30
 on_failure = "warn"
+```
+
+---
+
+## `[secrets]`
+
+External secrets management. Secrets are resolved at boot time (after `pre_boot` hooks) and held in memory only — never written to disk. See [secrets-management.md](secrets-management.md) for full documentation.
+
+### `[secrets.refs]`
+
+Secret references. Each key maps to a provider URI. Resolved values are available as `${secrets.<key>}` in other config fields.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `<name>` | string | — | URI referencing an external secret. Supported schemes: `aws-sm://`, `exec://`. |
+
+**URI formats:**
+- `aws-sm://<secret-id>#<json-key>` — fetch from AWS Secrets Manager, extract JSON field
+- `exec://<absolute-script-path> <key> <attribute>` — run script with two arguments, read stdout
+
+### `[secrets.aws]`
+
+AWS Secrets Manager provider configuration (optional).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `region` | string | auto | Override AWS region. Defaults to SDK credential chain (env/IMDS/IRSA). |
+| `endpoint_url` | string | — | Override endpoint URL (for LocalStack or VPC endpoints). |
+
+### `[secrets.exec]`
+
+Exec provider configuration (optional).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `timeout_seconds` | u64 | `10` | Max seconds per script invocation before kill. |
+
+```toml
+[secrets.refs]
+discord_token = "aws-sm://openab/prod#discord_bot_token"
+openai_key    = "aws-sm://openab/prod#openai_api_key"
+github_pat    = "exec:///home/agent/.local/bin/get-secret.sh vault/openab github_pat"
+
+[secrets.aws]
+region = "ap-northeast-1"
+
+[secrets.exec]
+timeout_seconds = 15
+
+[discord]
+bot_token = "${secrets.discord_token}"
 ```
 
 ---

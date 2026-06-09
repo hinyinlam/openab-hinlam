@@ -86,6 +86,8 @@ pub struct Config {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -94,6 +96,44 @@ pub struct WorkspaceConfig {
     /// Used with `[[ws:@alias]]` control directives.
     #[serde(default)]
     pub aliases: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SecretsConfig {
+    /// AWS Secrets Manager configuration.
+    #[serde(default)]
+    pub aws: AwsSecretsConfig,
+    /// Exec provider configuration.
+    #[serde(default)]
+    pub exec: ExecSecretsConfig,
+    /// Secret references: key = "aws-sm://..." or "exec://..."
+    #[serde(default)]
+    pub refs: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AwsSecretsConfig {
+    /// Override AWS region (otherwise uses default credential chain).
+    pub region: Option<String>,
+    /// Override endpoint URL (for LocalStack or VPC endpoints).
+    pub endpoint_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecSecretsConfig {
+    /// Per-invocation timeout in seconds (default: 10).
+    #[serde(default = "default_exec_timeout")]
+    pub timeout_seconds: u64,
+}
+
+impl Default for ExecSecretsConfig {
+    fn default() -> Self {
+        Self { timeout_seconds: 10 }
+    }
+}
+
+fn default_exec_timeout() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -728,13 +768,15 @@ fn expand_env_vars(raw: &str) -> String {
     .into_owned()
 }
 
-pub fn load_config(path: &Path) -> anyhow::Result<Config> {
+/// Load raw config text from a file path (env vars expanded but secrets NOT resolved).
+pub fn load_config_raw(path: &Path) -> anyhow::Result<String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
-    parse_config(&raw, path.display().to_string().as_str())
+    Ok(expand_env_vars(&raw))
 }
 
-pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
+/// Load raw config text from a URL (env vars expanded but secrets NOT resolved).
+pub async fn load_config_raw_from_url(url: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -751,7 +793,7 @@ pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
         .bytes()
         .await
         .map_err(|e| anyhow::anyhow!("failed to read response body from {url}: {e}"))?;
-    const MAX_CONFIG_BYTES: usize = 1024 * 1024; // 1 MiB
+    const MAX_CONFIG_BYTES: usize = 1024 * 1024;
     if bytes.len() > MAX_CONFIG_BYTES {
         anyhow::bail!(
             "remote config from {url} exceeds 1 MiB limit ({} bytes)",
@@ -760,12 +802,52 @@ pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
     }
     let raw = String::from_utf8(bytes.to_vec())
         .map_err(|e| anyhow::anyhow!("remote config from {url} is not valid UTF-8: {e}"))?;
+    Ok(expand_env_vars(&raw))
+}
+
+/// Parse config from already-expanded text.
+pub fn parse_config_str(expanded: &str, source: &str) -> anyhow::Result<Config> {
+    parse_config_inner(expanded, source)
+}
+
+#[cfg(test)]
+fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
+    let expanded = expand_env_vars(raw);
+    parse_config_inner(&expanded, source)
+}
+
+#[cfg(test)]
+fn load_config(path: &Path) -> anyhow::Result<Config> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    parse_config(&raw, path.display().to_string().as_str())
+}
+
+#[cfg(test)]
+async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fetch remote config from {url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("remote config request to {url} returned HTTP {status}");
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read response body from {url}: {e}"))?;
+    let raw = String::from_utf8(bytes.to_vec())
+        .map_err(|e| anyhow::anyhow!("remote config from {url} is not valid UTF-8: {e}"))?;
     parse_config(&raw, url)
 }
 
-fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
-    let expanded = expand_env_vars(raw);
-    let config: Config = toml::from_str(&expanded)
+fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
+    let config: Config = toml::from_str(expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
 
     // Validate max_buffered_messages > 0 (tokio::sync::mpsc::channel panics on 0)
@@ -1075,5 +1157,59 @@ echo_transcript = false
         let cfg = parse_config(toml, "test").unwrap();
         assert!(cfg.stt.enabled);
         assert!(!cfg.stt.echo_transcript);
+    }
+
+    #[test]
+    fn parse_secrets_config() {
+        let toml = r#"
+[discord]
+bot_token = "${secrets.discord_token}"
+
+[agent]
+command = "echo"
+
+[secrets.refs]
+discord_token = "aws-sm://openab/prod#discord_bot_token"
+github_pat = "exec:///home/agent/.local/bin/get-secret.sh vault/openab github_pat"
+
+[secrets.aws]
+region = "ap-northeast-1"
+endpoint_url = "http://localhost:4566"
+
+[secrets.exec]
+timeout_seconds = 15
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.secrets.refs.len(), 2);
+        assert_eq!(
+            cfg.secrets.refs.get("discord_token").unwrap(),
+            "aws-sm://openab/prod#discord_bot_token"
+        );
+        assert_eq!(
+            cfg.secrets.refs.get("github_pat").unwrap(),
+            "exec:///home/agent/.local/bin/get-secret.sh vault/openab github_pat"
+        );
+        assert_eq!(cfg.secrets.aws.region.as_deref(), Some("ap-northeast-1"));
+        assert_eq!(
+            cfg.secrets.aws.endpoint_url.as_deref(),
+            Some("http://localhost:4566")
+        );
+        assert_eq!(cfg.secrets.exec.timeout_seconds, 15);
+    }
+
+    #[test]
+    fn parse_secrets_config_defaults() {
+        let toml = r#"
+[discord]
+bot_token = "test"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.secrets.refs.is_empty());
+        assert!(cfg.secrets.aws.region.is_none());
+        assert!(cfg.secrets.aws.endpoint_url.is_none());
+        assert_eq!(cfg.secrets.exec.timeout_seconds, 10);
     }
 }
