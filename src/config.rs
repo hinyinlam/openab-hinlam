@@ -65,11 +65,63 @@ impl<'de> Deserialize<'de> for AllowBots {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentCoreConfig {
+    /// AgentCore Runtime ARN (required)
+    pub runtime_arn: String,
+    /// Cancel strategy: "noop" or "stop" (default: stop)
+    #[serde(default = "default_agentcore_cancel_strategy")]
+    pub cancel_strategy: AgentCoreCancelStrategy,
+}
+
+impl AgentCoreConfig {
+    /// Extract region from ARN: arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID
+    pub fn region(&self) -> String {
+        let parts: Vec<&str> = self.runtime_arn.split(':').collect();
+        if parts.len() >= 4 && !parts[3].is_empty() {
+            return parts[3].to_string();
+        }
+        "us-east-1".into() // fallback (should never hit with valid ARN)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentCoreCancelStrategy {
+    #[default]
+    Stop,
+    Noop,
+}
+
+impl<'de> Deserialize<'de> for AgentCoreCancelStrategy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "stop" => Ok(Self::Stop),
+            "noop" => Ok(Self::Noop),
+            other => Err(serde::de::Error::unknown_variant(other, &["stop", "noop"])),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentCoreCancelStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stop => write!(f, "stop"),
+            Self::Noop => write!(f, "noop"),
+        }
+    }
+}
+
+fn default_agentcore_cancel_strategy() -> AgentCoreCancelStrategy {
+    AgentCoreCancelStrategy::Stop
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
     pub gateway: Option<GatewayConfig>,
+    pub agentcore: Option<AgentCoreConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
@@ -441,6 +493,8 @@ pub struct AgentConfig {
     pub working_dir: String,
     pub env: HashMap<String, String>,
     pub inherit_env: Vec<String>,
+    /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
+    pub command_explicit: bool,
 }
 
 impl Default for AgentConfig {
@@ -451,6 +505,7 @@ impl Default for AgentConfig {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            command_explicit: false,
         }
     }
 }
@@ -476,6 +531,7 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             working_dir: raw.working_dir,
             env: raw.env,
             inherit_env: raw.inherit_env,
+            command_explicit: cmd_explicit,
         })
     }
 }
@@ -854,8 +910,46 @@ async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
 }
 
 fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
-    let config: Config = toml::from_str(expanded)
+    let mut config: Config = toml::from_str(expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
+
+    // If [agentcore] is set and [agent] command was not explicitly provided,
+    // synthesize agent config to spawn the bundled agentcore-acp adapter.
+    if let Some(ref ac) = config.agentcore {
+        // Validate ARN format: arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID
+        let parts: Vec<&str> = ac.runtime_arn.split(':').collect();
+        anyhow::ensure!(
+            parts.len() >= 6
+                && parts[0] == "arn"
+                && parts[2] == "bedrock-agentcore"
+                && !parts[3].is_empty()
+                && parts[5].starts_with("runtime/"),
+            "agentcore.runtime_arn is not a valid AgentCore Runtime ARN \
+             (expected arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID, got \"{}\")",
+            ac.runtime_arn
+        );
+
+        if !config.agent.command_explicit {
+            config.agent = AgentConfig {
+                command: "uv".into(),
+                args: vec![
+                    "run".into(),
+                    "--script".into(),
+                    "/opt/agentcore-acp/agentcore_acp.py".into(),
+                    "--runtime-arn".into(),
+                    ac.runtime_arn.clone(),
+                    "--region".into(),
+                    ac.region(),
+                    "--cancel-strategy".into(),
+                    ac.cancel_strategy.to_string(),
+                ],
+                working_dir: config.agent.working_dir.clone(),
+                env: config.agent.env.clone(),
+                inherit_env: config.agent.inherit_env.clone(),
+                command_explicit: true, // synthesized counts as explicit
+            };
+        }
+    }
 
     // Validate max_buffered_messages > 0 (tokio::sync::mpsc::channel panics on 0)
     // and max_batch_tokens > 0 (otherwise the consumer's token-cap check forces every
@@ -1229,5 +1323,136 @@ command = "echo"
             toml::from_str("bot_token = \"x\"\napp_token = \"y\"\nassistant_mode = false\n")
                 .unwrap();
         assert!(!cfg2.assistant_mode);
+    }
+
+    #[test]
+    fn agentcore_config_synthesizes_agent_command() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.agent.command, "uv");
+        assert!(cfg.agent.args.contains(&"--runtime-arn".to_string()));
+        assert!(cfg
+            .agent
+            .args
+            .contains(&"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()));
+        assert!(cfg.agent.args.contains(&"us-east-1".to_string()));
+    }
+
+    #[test]
+    fn agentcore_config_does_not_override_explicit_agent() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "my-custom-agent"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.agent.command, "my-custom-agent");
+    }
+
+    #[test]
+    fn agentcore_config_defaults() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let ac = cfg.agentcore.unwrap();
+        assert_eq!(ac.region(), "us-east-1");
+        assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Stop);
+    }
+
+    #[test]
+    fn agentcore_rejects_invalid_arn() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "not-a-valid-arn"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+    }
+
+    #[test]
+    fn agentcore_rejects_arn_wrong_service() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:s3:us-east-1:123456789012:bucket/my-bucket"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+    }
+
+    #[test]
+    fn agentcore_rejects_arn_missing_runtime_prefix() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:agent/my-agent"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+    }
+
+    #[test]
+    fn agentcore_rejects_invalid_cancel_strategy() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
+cancel_strategy = "stopp"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn agentcore_extracts_region_from_arn() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:runtime/tokyo-agent"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.agent.args.contains(&"ap-northeast-1".to_string()));
+    }
+
+    #[test]
+    fn agentcore_cancel_strategy_noop() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
+cancel_strategy = "noop"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let ac = cfg.agentcore.unwrap();
+        assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Noop);
     }
 }

@@ -177,6 +177,28 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 
 > 🔧 Running multiple agents? See [docs/multi-agent.md](docs/multi-agent.md)
 
+## AgentCore Runtime
+
+Run any coding agent remotely on [Amazon Bedrock AgentCore](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime.html) — no CLI bundled in the OAB image.
+
+```
+┌─────────┐       ┌─────────┐        ┌───────────────┐         ┌──────────────────────────┐
+│ Discord │       │         │  ACP   │               │  AWS    │   AgentCore Runtime      │
+│  Slack  │──────▶│   OAB   │───────▶│ agentcore-acp │──────▶  │   ┌──────────────────┐   │
+│Telegram │       │         │ stdio  │   (adapter)   │  SDK    │   │ Firecracker μVM  │   │
+└─────────┘       └─────────┘        └───────────────┘         │   │  Kiro / Claude…  │   │
+                                                               │   │  /mnt/workspace  │   │
+                                                               │   └──────────────────┘   │
+                                                               └──────────────────────────┘
+```
+
+```toml
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
+```
+
+Smaller image (~50MB), persistent filesystem, isolated microVMs, pay-per-use. See [docs/agentcore.md](docs/agentcore.md) for full setup.
+
 ## Configuration Reference
 
 > 📖 Full reference with all options, defaults, and Helm mapping: [docs/config-reference.md](docs/config-reference.md)
