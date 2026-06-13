@@ -13,14 +13,18 @@ on:
         type: choice
         options:
           - default
+          - agentcore
           - antigravity
           - claude
           - codex
           - copilot
           - cursor
           - gemini
+          - grok
           - hermes
+          - native
           - opencode
+          - pi
         default: 'default'
 
 env:

@@ -8,7 +8,7 @@ RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
 FROM node:22-bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini bubblewrap socat && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini bubblewrap socat unzip && rm -rf /var/lib/apt/lists/*
 
 # Install claude-agent-acp adapter and Claude Code CLI.
 # Without CLAUDE_CODE_EXECUTABLE the adapter uses its own bundled SDK cli.js,
@@ -31,10 +31,13 @@ WORKDIR /home/node
 
 COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab
 
-RUN mkdir -p /home/node/.claude && chown -R node:node /home/node/.claude
+RUN mkdir -p /home/node/.claude && chown -R node:node /home/node
 
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="claude"
+ENV OPENAB_AGENT_AUTH_COMMAND="claude auth login"
+
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
