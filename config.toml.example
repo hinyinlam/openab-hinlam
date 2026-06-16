@@ -115,6 +115,15 @@ working_dir = "/home/agent"
 # # Run `opencode auth login` once before starting openab.
 
 # [agent]
+# command = "mimo"
+# args = ["acp"]
+# working_dir = "/home/node"
+# # MiMo-Code (Xiaomi fork of OpenCode) with persistent memory, subagents,
+# # and MiMo Auto (free channel). Same ACP protocol as OpenCode.
+# # Install: npm install -g @mimo-ai/cli
+# # Auth: kubectl exec -it <pod> -- mimo auth login
+
+# [agent]
 # command = "cursor-agent"
 # args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
 # working_dir = "/home/agent"
