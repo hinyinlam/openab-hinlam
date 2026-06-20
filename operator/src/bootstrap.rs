@@ -307,7 +307,16 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
         .policy_name("oab-ecs-exec")
         .policy_document(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ssmmessages:CreateControlChannel","ssmmessages:CreateDataChannel","ssmmessages:OpenControlChannel","ssmmessages:OpenDataChannel"],"Resource":"*"}]}"#)
         .send().await.ok();
-        eprintln!("  ✓ IAM task role: {TASK_ROLE} (ECS Exec only)");
+        // S3 artifacts access (seed HOME on boot, backup on shutdown)
+        let artifacts_policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/artifacts/*"]}}]}}"#
+        );
+        iam.put_role_policy()
+            .role_name(TASK_ROLE)
+            .policy_name("oab-s3-artifacts")
+            .policy_document(&artifacts_policy)
+            .send().await.ok();
+        eprintln!("  ✓ IAM task role: {TASK_ROLE} (ECS Exec + S3 artifacts)");
         arn
     };
 
