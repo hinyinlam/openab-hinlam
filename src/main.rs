@@ -462,17 +462,69 @@ async fn main() -> anyhow::Result<()> {
         feature = "teams",
     ))]
     let _unified_handle = {
-        // Phase 2: Start embedded axum webhook server.
-        // Each compiled-in adapter mounts its webhook route, and incoming events
-        // are dispatched directly to the core Dispatcher (no WebSocket hop).
-        //
-        // Architecture:
-        //   Webhook → axum :8080 → process_gateway_event() → Dispatcher.submit()
-        //   Reply   ← adapter.send_reply() ← Agent
-        //
-        // The server only starts if at least one platform's env vars are configured.
-        // Port is configurable via GATEWAY_LISTEN env var (default: 0.0.0.0:8080).
-        None::<tokio::task::JoinHandle<()>>
+        use openab_core::gateway::{GatewayEventContext, process_gateway_event};
+
+        // Check if any gateway platform env vars are configured
+        let has_telegram = std::env::var("TELEGRAM_BOT_TOKEN").is_ok();
+        let has_line = std::env::var("LINE_CHANNEL_SECRET").is_ok();
+        let has_feishu = std::env::var("FEISHU_APP_ID").is_ok();
+        let has_googlechat = std::env::var("GOOGLE_CHAT_ENABLED")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let has_wecom = std::env::var("WECOM_CORP_ID").is_ok();
+        let has_teams = std::env::var("TEAMS_APP_ID").is_ok();
+
+        if has_telegram || has_line || has_feishu || has_googlechat || has_wecom || has_teams {
+            let listen_addr = std::env::var("GATEWAY_LISTEN")
+                .unwrap_or_else(|_| "0.0.0.0:8080".into());
+
+            // Create a dedicated dispatcher for unified gateway events
+            let unified_dispatcher = Arc::new(dispatch::Dispatcher::new(router.clone(), 8, None));
+            dispatchers.lock().unwrap().push(unified_dispatcher.clone());
+
+            // In unified mode, the GatewayAdapter is not needed for dispatch —
+            // process_gateway_event() submits directly to the Dispatcher.
+            // For reply routing, the gateway crate's platform-specific reply handlers
+            // are invoked directly (same as standalone gateway binary).
+            // For now, we create a minimal event context for the dispatch path.
+            let event_ctx = Arc::new(GatewayEventContext {
+                adapter: shared_discord_adapter.clone()
+                    .unwrap_or_else(|| shared_slack_adapter.clone()
+                        .expect("unified mode requires at least one core adapter")),
+                dispatcher: unified_dispatcher,
+                router: router.clone(),
+                allow_all_channels: true,
+                allowed_channels: std::collections::HashSet::new(),
+                allow_all_users: true,
+                allowed_users: std::collections::HashSet::new(),
+                bot_username: None,
+                stt_config: cfg.stt.clone(),
+            });
+
+            let _event_ctx = event_ctx; // will be used when adapter routes are wired
+
+            info!(addr = %listen_addr, "unified webhook server starting");
+
+            Some(tokio::spawn(async move {
+                // Minimal health endpoint — adapters routes will be added per-platform
+                let app = axum::Router::new()
+                    .route("/health", axum::routing::get(|| async { "ok" }));
+
+                let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!(addr = %listen_addr, error = %e, "unified webhook server bind failed");
+                        return;
+                    }
+                };
+                info!(addr = %listen_addr, "unified webhook server listening");
+                if let Err(e) = axum::serve(listener, app).await {
+                    error!(error = %e, "unified webhook server error");
+                }
+            }))
+        } else {
+            None
+        }
     };
 
     let usercron_path = if cfg.cron.usercron_enabled {
