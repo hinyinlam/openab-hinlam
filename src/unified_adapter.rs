@@ -138,7 +138,8 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         self.dispatch_reply(&reply).await;
         Ok(MessageRef {
             channel: channel.clone(),
-            message_id: format!("unified_{}", uuid::Uuid::new_v4()),
+            message_id: format!("unified_{:x}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
         })
     }
 
@@ -188,7 +189,8 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         self.dispatch_reply(&reply).await;
         Ok(MessageRef {
             channel: channel.clone(),
-            message_id: format!("unified_{}", uuid::Uuid::new_v4()),
+            message_id: format!("unified_{:x}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
         })
     }
 

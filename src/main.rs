@@ -488,7 +488,13 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "0.0.0.0:8080".into());
 
             // Create a dedicated dispatcher for unified gateway events
-            let unified_dispatcher = Arc::new(dispatch::Dispatcher::new(router.clone(), 8, None));
+            let unified_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
+                router.clone(),
+                1,
+                24_000,
+                dispatch::BatchGrouping::Thread,
+                dispatch::PER_MESSAGE_CONSUMER_IDLE_TIMEOUT,
+            ));
             dispatchers.lock().unwrap().push(unified_dispatcher.clone());
 
             // Bridge: reuse gateway crate's AppState + webhook handlers.
