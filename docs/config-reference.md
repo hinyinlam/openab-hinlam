@@ -84,6 +84,8 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 | `allowed_channels` | string[] | `[]` | Chat/group IDs to allow. Only checked when `allow_all_channels` resolves to false. |
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |
 | `allowed_users` | string[] | `[]` | User IDs to allow. Only checked when `allow_all_users` resolves to false. |
+| `allow_bot_messages` | bool | `false` | Allow messages from bots. Unlike Discord/Slack (which use an enum with `"off"`/`"mentions"`/`"all"`), the gateway adapter uses a simple boolean: `true` = allow all bots, `false` = block (unless in `trusted_bot_ids`). |
+| `trusted_bot_ids` | string[] | `[]` | Bot IDs that bypass the bot filter even when `allow_bot_messages = false`. |
 | `streaming` | bool | `false` | Enable streaming (typewriter) mode — requires the gateway platform to support message editing. |
 | `streaming_placeholder` | bool | `true` | Show "…" placeholder at streaming start. Set `false` for platforms using drafts (e.g. Telegram Rich Messages). |
 | `message_processing_mode` | string | `"per-message"` | Same as Discord. See [Message Dispatch Modes](message-dispatch-modes.md). |
@@ -554,3 +556,44 @@ bot_token = "${DISCORD_BOT_TOKEN}"
 ```
 
 Undefined variables resolve to an empty string.
+
+---
+
+## Unified Mode Environment Variables
+
+When running with `BUILD_MODE=unified`, the binary embeds a webhook server for gateway platforms. These env vars control its behavior:
+
+### Server
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_LISTEN` | `0.0.0.0:8080` | Bind address for the embedded webhook server |
+
+### Security Gating
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_ALLOW_ALL_CHANNELS` | `true` | Accept events from any channel. **Set to `false` in production** and use `GATEWAY_ALLOWED_CHANNELS`. |
+| `GATEWAY_ALLOWED_CHANNELS` | _(empty)_ | Comma-separated channel IDs to allow (when `GATEWAY_ALLOW_ALL_CHANNELS=false`) |
+| `GATEWAY_ALLOW_ALL_USERS` | `true` | Accept events from any user. **Set to `false` in production** and use `GATEWAY_ALLOWED_USERS`. |
+| `GATEWAY_ALLOWED_USERS` | _(empty)_ | Comma-separated user IDs to allow (when `GATEWAY_ALLOW_ALL_USERS=false`) |
+| `GATEWAY_ALLOW_BOT_MESSAGES` | `false` | Allow messages from all bots (for multi-agent scenarios) |
+| `GATEWAY_TRUSTED_BOT_IDS` | _(empty)_ | Comma-separated bot IDs to allow even when `GATEWAY_ALLOW_BOT_MESSAGES=false` |
+| `GATEWAY_BOT_USERNAME` | _(empty)_ | Bot's username for @mention detection in groups |
+
+### Platform Adapters
+
+Each platform is auto-enabled when its env vars are present:
+
+| Platform | Required Env Var | Optional |
+|----------|-----------------|----------|
+| Telegram | `TELEGRAM_BOT_TOKEN` | `TELEGRAM_SECRET_TOKEN`, `TELEGRAM_WEBHOOK_PATH`, `TELEGRAM_RICH_MESSAGES` |
+| LINE | `LINE_CHANNEL_SECRET` | `LINE_CHANNEL_ACCESS_TOKEN` |
+| Feishu | `FEISHU_APP_ID` | `FEISHU_WEBHOOK_PATH` |
+| Google Chat | `GOOGLE_CHAT_ENABLED=true` | `GOOGLE_CHAT_SA_KEY_JSON`, `GOOGLE_CHAT_SA_KEY_FILE`, `GOOGLE_CHAT_ACCESS_TOKEN`, `GOOGLE_CHAT_AUDIENCE`, `GOOGLE_CHAT_WEBHOOK_PATH` |
+| WeCom | `WECOM_CORP_ID` | _(see wecom config)_ |
+| Teams | `TEAMS_APP_ID` | `TEAMS_WEBHOOK_PATH` |
+
+> ⚠️ **Production checklist**: Set `GATEWAY_ALLOW_ALL_CHANNELS=false` and `GATEWAY_ALLOW_ALL_USERS=false` with explicit allowlists. The defaults are permissive for development convenience.
+>
+> ⚠️ **Google Chat JWT**: When `GOOGLE_CHAT_AUDIENCE` is unset, webhook requests are **not** verified via JWT. Set this to your Google Chat app's project number or service account email in production to enable request authentication. If `GOOGLE_CHAT_SA_KEY_FILE` is set but the file cannot be read, the adapter starts without token authentication (warn logged).

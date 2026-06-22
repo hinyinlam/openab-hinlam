@@ -40,6 +40,48 @@ fn platform_acks_writes(platform: &str) -> bool {
     EDIT_RESPONSE_PLATFORMS.contains(&platform)
 }
 
+/// Shared filter parameters for gateway event gating.
+/// Used by both `run_gateway_adapter` (WebSocket) and `process_gateway_event` (unified).
+struct EventFilterParams<'a> {
+    allow_all_channels: bool,
+    allowed_channels: &'a HashSet<String>,
+    allow_all_users: bool,
+    allowed_users: &'a HashSet<String>,
+    allow_bot_messages: bool,
+    trusted_bot_ids: &'a HashSet<String>,
+    bot_username: Option<&'a str>,
+}
+
+/// Returns `true` if the event should be skipped (filtered out).
+fn should_skip_event(event: &GatewayEvent, filter: &EventFilterParams) -> bool {
+    // Bot filter
+    if event.sender.is_bot && !filter.allow_bot_messages && !filter.trusted_bot_ids.contains(&event.sender.id) {
+        tracing::info!(sender = %event.sender.id, "gateway: bot not in trusted_bot_ids, skipping");
+        return true;
+    }
+    // Channel allowlist
+    if !filter.allow_all_channels && !filter.allowed_channels.contains(&event.channel.id) {
+        tracing::info!(channel = %event.channel.id, "gateway: channel not in allowed_channels, skipping");
+        return true;
+    }
+    // User allowlist
+    if !filter.allow_all_users && !filter.allowed_users.contains(&event.sender.id) {
+        tracing::info!(sender = %event.sender.id, "gateway: user not in allowed_users, skipping");
+        return true;
+    }
+    // @mention gating: in groups, only respond if bot is mentioned
+    let is_group = event.channel.channel_type == "group" || event.channel.channel_type == "supergroup";
+    let in_thread = event.channel.thread_id.is_some();
+    if is_group && !in_thread {
+        if let Some(bot_name) = filter.bot_username {
+            if !event.mentions.iter().any(|m| m == bot_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // --- Gateway event/reply schemas (mirrors gateway service) ---
 
 #[derive(Clone, Debug, Deserialize)]
@@ -677,6 +719,8 @@ pub struct GatewayParams {
     pub allowed_channels: Vec<String>,
     pub allow_all_users: bool,
     pub allowed_users: Vec<String>,
+    pub allow_bot_messages: bool,
+    pub trusted_bot_ids: Vec<String>,
     pub streaming: bool,
     pub streaming_placeholder: bool,
     pub stt: crate::config::SttConfig,
@@ -694,9 +738,11 @@ pub async fn run_gateway_adapter(
     let gateway_url = params.url;
     let bot_username = params.bot_username;
     let allow_all_channels = params.allow_all_channels;
-    let allowed_channels = params.allowed_channels;
+    let allowed_channels: HashSet<String> = params.allowed_channels.into_iter().collect();
     let allow_all_users = params.allow_all_users;
-    let allowed_users = params.allowed_users;
+    let allowed_users: HashSet<String> = params.allowed_users.into_iter().collect();
+    let allow_bot_messages = params.allow_bot_messages;
+    let trusted_bot_ids: HashSet<String> = params.trusted_bot_ids.into_iter().collect();
     let streaming = params.streaming;
     let streaming_placeholder = params.streaming_placeholder;
     let stt_config = params.stt;
@@ -753,6 +799,17 @@ pub async fn run_gateway_adapter(
         let slash_ws_tx = ws_tx.clone(); // for fire-and-forget slash command responses
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
+        // Hoist filter params outside loop — all fields are loop-invariant
+        let filter = EventFilterParams {
+            allow_all_channels,
+            allowed_channels: &allowed_channels,
+            allow_all_users,
+            allowed_users: &allowed_users,
+            allow_bot_messages,
+            trusted_bot_ids: &trusted_bot_ids,
+            bot_username: bot_username.as_deref(),
+        };
+
         loop {
             tokio::select! {
                     msg = ws_rx.next() => {
@@ -772,39 +829,8 @@ pub async fn run_gateway_adapter(
 
                             match serde_json::from_str::<GatewayEvent>(text_str) {
                                 Ok(event) => {
-                                    // TODO: gateway adapters (feishu) do their own bot filtering
-                                    // via AllowBots + trusted_bot_ids, but Telegram does not.
-                                    // When Feishu lifts the bot-to-bot delivery restriction,
-                                    // this guard needs to become adapter-aware (e.g. a field on
-                                    // GatewayEvent indicating the adapter already filtered bots).
-                                    if event.sender.is_bot {
+                                    if should_skip_event(&event, &filter) {
                                         continue;
-                                    }
-
-                                    // Channel allowlist gate
-                                    if !allow_all_channels && !allowed_channels.contains(&event.channel.id) {
-                                        info!(channel = %event.channel.id, "gateway: channel not in allowed_channels, skipping");
-                                        continue;
-                                    }
-
-                                    // User allowlist gate
-                                    if !allow_all_users && !allowed_users.contains(&event.sender.id) {
-                                        info!(sender = %event.sender.id, "gateway: user not in allowed_users, skipping");
-                                        continue;
-                                    }
-
-                                    // @mention gating: in groups, only respond if bot is mentioned
-                                    // DMs (private) and thread replies always pass through
-                                    let is_group = event.channel.channel_type == "group"
-                                        || event.channel.channel_type == "supergroup";
-                                    let in_thread = event.channel.thread_id.is_some();
-                                    if is_group && !in_thread {
-                                        if let Some(ref bot_name) = bot_username {
-                                            let mentioned = event.mentions.iter().any(|m| m == bot_name);
-                                            if !mentioned {
-                                                continue; // skip non-mentioned group messages
-                                            }
-                                        }
                                     }
 
                                     info!(
@@ -894,6 +920,11 @@ pub async fn run_gateway_adapter(
                                                 .decode(&att.data)
                                                 .map_err(|e| e.to_string())
                                         } else {
+                                            tracing::warn!(
+                                                filename = %att.filename,
+                                                mime = %att.mime_type,
+                                                "gateway: attachment has no path or data, skipping"
+                                            );
                                             Err("no path or data".into())
                                         };
 
@@ -1009,7 +1040,7 @@ pub async fn run_gateway_adapter(
                                             match adapter.create_thread(&channel, &trigger_msg, &title).await {
                                                 Ok(tc) => tc,
                                                 Err(e) => {
-                                                    warn!("create_thread failed, using channel: {e}");
+                                                    warn!("create_thread failed, replying in channel: {e}");
                                                     channel.clone()
                                                 }
                                             }
@@ -1097,6 +1128,8 @@ pub struct GatewayEventContext {
     pub allowed_channels: HashSet<String>,
     pub allow_all_users: bool,
     pub allowed_users: HashSet<String>,
+    pub allow_bot_messages: bool,
+    pub trusted_bot_ids: HashSet<String>,
     pub bot_username: Option<String>,
     pub stt_config: crate::config::SttConfig,
 }
@@ -1114,34 +1147,18 @@ pub async fn process_gateway_event(
     let event: GatewayEvent = serde_json::from_str(event_json)
         .map_err(|e| anyhow::anyhow!("invalid gateway event JSON: {e}"))?;
 
-    // Bot filter
-    if event.sender.is_bot {
+    // Shared filter logic
+    let filter = EventFilterParams {
+        allow_all_channels: ctx.allow_all_channels,
+        allowed_channels: &ctx.allowed_channels,
+        allow_all_users: ctx.allow_all_users,
+        allowed_users: &ctx.allowed_users,
+        allow_bot_messages: ctx.allow_bot_messages,
+        trusted_bot_ids: &ctx.trusted_bot_ids,
+        bot_username: ctx.bot_username.as_deref(),
+    };
+    if should_skip_event(&event, &filter) {
         return Ok(false);
-    }
-
-    // Channel allowlist gate
-    if !ctx.allow_all_channels && !ctx.allowed_channels.contains(&event.channel.id) {
-        tracing::info!(channel = %event.channel.id, "gateway: channel not in allowed_channels, skipping");
-        return Ok(false);
-    }
-
-    // User allowlist gate
-    if !ctx.allow_all_users && !ctx.allowed_users.contains(&event.sender.id) {
-        tracing::info!(sender = %event.sender.id, "gateway: user not in allowed_users, skipping");
-        return Ok(false);
-    }
-
-    // @mention gating: in groups, only respond if bot is mentioned
-    let is_group = event.channel.channel_type == "group"
-        || event.channel.channel_type == "supergroup";
-    let in_thread = event.channel.thread_id.is_some();
-    if is_group && !in_thread {
-        if let Some(ref bot_name) = ctx.bot_username {
-            let mentioned = event.mentions.iter().any(|m| m == bot_name);
-            if !mentioned {
-                return Ok(false);
-            }
-        }
     }
 
     tracing::info!(
@@ -1205,26 +1222,41 @@ pub async fn process_gateway_event(
                 .decode(&att.data)
                 .map_err(|e| e.to_string())
         } else {
+            tracing::warn!(
+                filename = %att.filename,
+                mime = %att.mime_type,
+                "gateway: attachment has no path or data, skipping"
+            );
             Err("no path or data".into())
         };
 
         match att.attachment_type.as_str() {
             "image" => {
-                if let Ok(bytes) = bytes_result {
-                    use base64::Engine;
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                    extra_blocks.push(ContentBlock::Image {
-                        media_type: att.mime_type.clone(),
-                        data: b64,
-                    });
+                match bytes_result {
+                    Ok(bytes) => {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        extra_blocks.push(ContentBlock::Image {
+                            media_type: att.mime_type.clone(),
+                            data: b64,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(filename = %att.filename, error = %e, "gateway image read failed");
+                    }
                 }
             }
             "text_file" => {
-                if let Ok(bytes) = bytes_result {
-                    let text = String::from_utf8_lossy(&bytes);
-                    extra_blocks.push(ContentBlock::Text {
-                        text: format!("```{}\n{}\n```", att.filename, text),
-                    });
+                match bytes_result {
+                    Ok(bytes) => {
+                        let text = String::from_utf8_lossy(&bytes);
+                        extra_blocks.push(ContentBlock::Text {
+                            text: format!("```{}\n{}\n```", att.filename, text),
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(filename = %att.filename, error = %e, "gateway text_file read failed");
+                    }
                 }
             }
             "audio" if ctx.stt_config.enabled => {
@@ -1307,7 +1339,7 @@ pub async fn process_gateway_event(
             match adapter.create_thread(&channel, &trigger_msg, &title).await {
                 Ok(tc) => tc,
                 Err(e) => {
-                    tracing::warn!("create_thread failed, using channel: {e}");
+                    tracing::warn!("create_thread failed, replying in channel: {e}");
                     channel.clone()
                 }
             }
@@ -1355,5 +1387,134 @@ fn format_size(n: u64) -> String {
         format!("{:.1} KB", n as f64 / 1024.0)
     } else {
         format!("{} B", n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn make_event(is_bot: bool, sender_id: &str, channel_id: &str, channel_type: &str, thread_id: Option<&str>, mentions: Vec<&str>) -> GatewayEvent {
+        serde_json::from_value(serde_json::json!({
+            "schema": "openab.gateway.event.v1",
+            "event_id": "evt1",
+            "timestamp": "",
+            "platform": "test",
+            "channel": { "id": channel_id, "type": channel_type, "thread_id": thread_id },
+            "sender": { "id": sender_id, "name": "user", "display_name": "User", "is_bot": is_bot },
+            "content": { "type": "text", "text": "hello" },
+            "mentions": mentions,
+            "message_id": "msg1"
+        })).unwrap()
+    }
+
+    fn default_filter<'a>(allowed_channels: &'a HashSet<String>, allowed_users: &'a HashSet<String>, trusted_bot_ids: &'a HashSet<String>) -> EventFilterParams<'a> {
+        EventFilterParams {
+            allow_all_channels: true,
+            allowed_channels,
+            allow_all_users: true,
+            allowed_users,
+            allow_bot_messages: false,
+            trusted_bot_ids,
+            bot_username: None,
+        }
+    }
+
+    #[test]
+    fn bot_blocked_by_default() {
+        let ch = HashSet::new();
+        let us = HashSet::new();
+        let tb = HashSet::new();
+        let filter = default_filter(&ch, &us, &tb);
+        let event = make_event(true, "bot1", "ch1", "dm", None, vec![]);
+        assert!(should_skip_event(&event, &filter));
+    }
+
+    #[test]
+    fn trusted_bot_passes() {
+        let ch = HashSet::new();
+        let us = HashSet::new();
+        let tb: HashSet<String> = ["bot1".into()].into();
+        let filter = default_filter(&ch, &us, &tb);
+        let event = make_event(true, "bot1", "ch1", "dm", None, vec![]);
+        assert!(!should_skip_event(&event, &filter));
+    }
+
+    #[test]
+    fn all_bots_allowed() {
+        let ch = HashSet::new();
+        let us = HashSet::new();
+        let tb = HashSet::new();
+        let mut filter = default_filter(&ch, &us, &tb);
+        filter.allow_bot_messages = true;
+        let event = make_event(true, "bot1", "ch1", "dm", None, vec![]);
+        assert!(!should_skip_event(&event, &filter));
+    }
+
+    #[test]
+    fn channel_allowlist_blocks() {
+        let ch: HashSet<String> = ["allowed_ch".into()].into();
+        let us = HashSet::new();
+        let tb = HashSet::new();
+        let mut filter = default_filter(&ch, &us, &tb);
+        filter.allow_all_channels = false;
+        let event = make_event(false, "u1", "other_ch", "dm", None, vec![]);
+        assert!(should_skip_event(&event, &filter));
+    }
+
+    #[test]
+    fn channel_allowlist_passes() {
+        let ch: HashSet<String> = ["ch1".into()].into();
+        let us = HashSet::new();
+        let tb = HashSet::new();
+        let mut filter = default_filter(&ch, &us, &tb);
+        filter.allow_all_channels = false;
+        let event = make_event(false, "u1", "ch1", "dm", None, vec![]);
+        assert!(!should_skip_event(&event, &filter));
+    }
+
+    #[test]
+    fn user_allowlist_blocks() {
+        let ch = HashSet::new();
+        let us: HashSet<String> = ["allowed_user".into()].into();
+        let tb = HashSet::new();
+        let mut filter = default_filter(&ch, &us, &tb);
+        filter.allow_all_users = false;
+        let event = make_event(false, "other_user", "ch1", "dm", None, vec![]);
+        assert!(should_skip_event(&event, &filter));
+    }
+
+    #[test]
+    fn group_without_mention_skipped() {
+        let ch = HashSet::new();
+        let us = HashSet::new();
+        let tb = HashSet::new();
+        let mut filter = default_filter(&ch, &us, &tb);
+        filter.bot_username = Some("mybot");
+        let event = make_event(false, "u1", "ch1", "group", None, vec![]);
+        assert!(should_skip_event(&event, &filter));
+    }
+
+    #[test]
+    fn group_with_mention_passes() {
+        let ch = HashSet::new();
+        let us = HashSet::new();
+        let tb = HashSet::new();
+        let mut filter = default_filter(&ch, &us, &tb);
+        filter.bot_username = Some("mybot");
+        let event = make_event(false, "u1", "ch1", "group", None, vec!["mybot"]);
+        assert!(!should_skip_event(&event, &filter));
+    }
+
+    #[test]
+    fn thread_in_group_bypasses_mention_gating() {
+        let ch = HashSet::new();
+        let us = HashSet::new();
+        let tb = HashSet::new();
+        let mut filter = default_filter(&ch, &us, &tb);
+        filter.bot_username = Some("mybot");
+        let event = make_event(false, "u1", "ch1", "group", Some("thread1"), vec![]);
+        assert!(!should_skip_event(&event, &filter));
     }
 }

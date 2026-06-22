@@ -462,6 +462,16 @@ pub struct GatewayConfig {
     pub allowed_channels: Vec<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Allow messages from bots. Default: false.
+    /// NOTE: Intentionally `bool` (not `AllowBots` enum) — the gateway adapter
+    /// only needs on/off since @mention gating is handled separately by
+    /// `bot_username` + `should_skip_event`. Discord/Slack use `AllowBots` because
+    /// their adapters embed mention-mode logic internally.
+    #[serde(default)]
+    pub allow_bot_messages: bool,
+    /// Bot IDs that bypass the bot filter even when allow_bot_messages is false.
+    #[serde(default)]
+    pub trusted_bot_ids: Vec<String>,
     /// Enable streaming (typewriter) mode — requires gateway platform to support message editing.
     /// Defaults to `false`, so gateway platforms (Telegram / LINE / Google Chat) are **send-once
     /// by default**. By default send-once delivers **only the final answer block** — the text after

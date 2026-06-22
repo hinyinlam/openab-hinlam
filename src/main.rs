@@ -443,6 +443,8 @@ async fn main() -> anyhow::Result<()> {
                 &gw_cfg.allowed_users,
             ),
             allowed_users: gw_cfg.allowed_users,
+            allow_bot_messages: gw_cfg.allow_bot_messages,
+            trusted_bot_ids: gw_cfg.trusted_bot_ids,
             streaming: gw_cfg.streaming,
             streaming_placeholder: gw_cfg.streaming_placeholder,
             stt: cfg.stt.clone(),
@@ -503,38 +505,8 @@ async fn main() -> anyhow::Result<()> {
             // This reuses 100% of existing adapter code (signature verify, parsing, etc).
             let (event_tx, _) = tokio::sync::broadcast::channel::<String>(256);
 
-            // Build gateway AppState (same as standalone binary)
-            let gw_state = Arc::new(openab_gateway::AppState {
-                telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN").ok(),
-                telegram_secret_token: std::env::var("TELEGRAM_SECRET_TOKEN").ok(),
-                telegram_rich_messages: std::env::var("TELEGRAM_RICH_MESSAGES")
-                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                    .unwrap_or(true),
-                line_channel_secret: std::env::var("LINE_CHANNEL_SECRET").ok(),
-                line_access_token: std::env::var("LINE_CHANNEL_ACCESS_TOKEN").ok(),
-                #[cfg(feature = "teams")]
-                teams: openab_gateway::adapters::teams::TeamsConfig::from_env()
-                    .map(openab_gateway::adapters::teams::TeamsAdapter::new),
-                teams_service_urls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-                #[cfg(feature = "feishu")]
-                feishu: openab_gateway::adapters::feishu::FeishuConfig::from_env()
-                    .map(openab_gateway::adapters::feishu::FeishuAdapter::new),
-                #[cfg(feature = "googlechat")]
-                google_chat: None, // TODO: wire up googlechat adapter config
-                #[cfg(feature = "wecom")]
-                wecom: openab_gateway::adapters::wecom::WecomConfig::from_env()
-                    .map(openab_gateway::adapters::wecom::WecomAdapter::new),
-                ws_token: None, // not needed in unified mode (no WS endpoint)
-                event_tx: event_tx.clone(),
-                reply_token_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-                line_webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                    openab_gateway::LINE_WEBHOOK_CONCURRENCY_MAX,
-                )),
-                client: reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(30))
-                    .build()
-                    .expect("HTTP client must build"),
-            });
+            // Build gateway AppState from env vars (shared factory with standalone gateway)
+            let gw_state = Arc::new(openab_gateway::AppState::from_env(event_tx.clone(), None));
 
             // Build axum router with platform webhook routes
             let mut app = axum::Router::new()
@@ -578,6 +550,14 @@ async fn main() -> anyhow::Result<()> {
                 app = app.route(&path, axum::routing::post(openab_gateway::adapters::teams::webhook));
             }
 
+            #[cfg(feature = "googlechat")]
+            if gw_state.google_chat.is_some() {
+                let path = std::env::var("GOOGLE_CHAT_WEBHOOK_PATH")
+                    .unwrap_or_else(|_| "/webhook/googlechat".into());
+                info!(path = %path, "unified: googlechat adapter enabled");
+                app = app.route(&path, axum::routing::post(openab_gateway::adapters::googlechat::webhook));
+            }
+
             let app = app.with_state(gw_state.clone());
 
             // Bridge task: receive events from adapters via event_tx, dispatch to core
@@ -608,6 +588,17 @@ async fn main() -> anyhow::Result<()> {
                     .collect();
             let gw_bot_username = std::env::var("GATEWAY_BOT_USERNAME").ok();
 
+            let gw_allow_bot_messages = std::env::var("GATEWAY_ALLOW_BOT_MESSAGES")
+                .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false);
+            let gw_trusted_bot_ids: std::collections::HashSet<String> =
+                std::env::var("GATEWAY_TRUSTED_BOT_IDS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
             let event_ctx = Arc::new(GatewayEventContext {
                 adapter: unified_adapter,
                 dispatcher: unified_dispatcher,
@@ -622,6 +613,8 @@ async fn main() -> anyhow::Result<()> {
                     &gw_allowed_users.iter().cloned().collect::<Vec<_>>(),
                 ),
                 allowed_users: gw_allowed_users,
+                allow_bot_messages: gw_allow_bot_messages,
+                trusted_bot_ids: gw_trusted_bot_ids,
                 bot_username: gw_bot_username,
                 stt_config: cfg.stt.clone(),
             });

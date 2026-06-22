@@ -46,6 +46,107 @@ pub struct AppState {
     pub client: reqwest::Client,
 }
 
+
+impl AppState {
+    /// Build AppState from environment variables.
+    /// Initializes all platform adapters based on available env vars.
+    /// `ws_token` is passed separately (only needed for standalone gateway mode).
+    pub fn from_env(event_tx: broadcast::Sender<String>, ws_token: Option<String>) -> Self {
+        use tracing::{info, warn};
+
+        // Telegram
+        let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
+        let telegram_secret_token = std::env::var("TELEGRAM_SECRET_TOKEN").ok();
+        let telegram_rich_messages = std::env::var("TELEGRAM_RICH_MESSAGES")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+
+        // LINE
+        let line_channel_secret = std::env::var("LINE_CHANNEL_SECRET").ok();
+        let line_access_token = std::env::var("LINE_CHANNEL_ACCESS_TOKEN").ok();
+
+        // Teams
+        #[cfg(feature = "teams")]
+        let teams = adapters::teams::TeamsConfig::from_env().map(|config| {
+            info!("teams adapter configured");
+            adapters::teams::TeamsAdapter::new(config)
+        });
+
+        // Feishu
+        #[cfg(feature = "feishu")]
+        let feishu = adapters::feishu::FeishuConfig::from_env()
+            .map(adapters::feishu::FeishuAdapter::new);
+
+        // Google Chat
+        #[cfg(feature = "googlechat")]
+        let google_chat = {
+            let enabled = std::env::var("GOOGLE_CHAT_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
+            if enabled {
+                let token_cache = std::env::var("GOOGLE_CHAT_SA_KEY_JSON")
+                    .ok()
+                    .or_else(|| {
+                        std::env::var("GOOGLE_CHAT_SA_KEY_FILE")
+                            .ok()
+                            .and_then(|path| {
+                                std::fs::read_to_string(&path).map_err(|e| {
+                                    warn!("failed to read GOOGLE_CHAT_SA_KEY_FILE '{}': {e}", path);
+                                }).ok()
+                            })
+                    })
+                    .and_then(|json| {
+                        adapters::googlechat::GoogleChatTokenCache::new(&json)
+                            .map_err(|e| warn!("googlechat SA key error: {e}"))
+                            .ok()
+                    });
+                let access_token = std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok();
+                let jwt_verifier = std::env::var("GOOGLE_CHAT_AUDIENCE").ok().map(|aud| {
+                    info!("googlechat JWT verification enabled (audience={aud})");
+                    adapters::googlechat::GoogleChatJwtVerifier::new(aud)
+                });
+                Some(adapters::googlechat::GoogleChatAdapter::new(
+                    token_cache, access_token, jwt_verifier,
+                ))
+            } else {
+                None
+            }
+        };
+
+        // WeCom
+        #[cfg(feature = "wecom")]
+        let wecom = adapters::wecom::WecomConfig::from_env()
+            .map(adapters::wecom::WecomAdapter::new);
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("HTTP client must build");
+
+        Self {
+            telegram_bot_token,
+            telegram_secret_token,
+            telegram_rich_messages,
+            line_channel_secret,
+            line_access_token,
+            #[cfg(feature = "teams")]
+            teams,
+            teams_service_urls: Mutex::new(HashMap::new()),
+            #[cfg(feature = "feishu")]
+            feishu,
+            #[cfg(feature = "googlechat")]
+            google_chat,
+            #[cfg(feature = "wecom")]
+            wecom,
+            ws_token,
+            event_tx,
+            reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
+            client,
+        }
+    }
+}
+
 // --- Public serve() entry point ---
 
 /// Configuration for the standalone gateway server.
@@ -197,7 +298,11 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                 .or_else(|| {
                     std::env::var("GOOGLE_CHAT_SA_KEY_FILE")
                         .ok()
-                        .and_then(|path| std::fs::read_to_string(&path).ok())
+                        .and_then(|path| {
+                            std::fs::read_to_string(&path).map_err(|e| {
+                                warn!("failed to read GOOGLE_CHAT_SA_KEY_FILE '{}': {e}", path);
+                            }).ok()
+                        })
                 })
                 .and_then(|json| {
                     adapters::googlechat::GoogleChatTokenCache::new(&json)
