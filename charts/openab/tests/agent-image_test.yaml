@@ -1,0 +1,53 @@
+suite: agentImage unified tag format
+templates:
+  - templates/deployment.yaml
+
+tests:
+  - it: kiro (default) resolves to openab:<appVersion> with no agent suffix
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: "ghcr.io/openabdev/openab:0.9.0-beta.1"
+
+  - it: non-kiro agent resolves to openab:<appVersion>-<agent>
+    set:
+      agents.claude.command: claude-agent-acp
+    documentIndex: 1
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: "ghcr.io/openabdev/openab:0.9.0-beta.1-claude"
+
+  - it: image.tag override applies to kiro
+    set:
+      image.tag: "beta"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: "ghcr.io/openabdev/openab:beta"
+
+  - it: image.tag override applies to non-kiro agent with suffix
+    set:
+      image.tag: "beta"
+      agents.codex.command: codex-acp
+    documentIndex: 1
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: "ghcr.io/openabdev/openab:beta-codex"
+
+  - it: explicit per-agent image string with tag is used verbatim
+    set:
+      agents.kiro.image: "ghcr.io/custom/image:v1.0"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: "ghcr.io/custom/image:v1.0"
+
+  - it: explicit per-agent image string without tag gets appVersion appended
+    set:
+      agents.kiro.image: "ghcr.io/custom/image"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: "ghcr.io/custom/image:0.9.0-beta.1"
