@@ -1171,6 +1171,8 @@ impl EventHandler for Handler {
                     "delay",
                     "Delay before firing (e.g. 30m, 2h, 1d)",
                 ).required(true)),
+            CreateCommand::new("auth")
+                .description("Authenticate the backend agent (device flow)"),
             CreateCommand::new("export-thread")
                 .description("Download this thread as a text file")
                 .add_option(CreateCommandOption::new(
@@ -1258,6 +1260,9 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "export-thread" => {
                 self.handle_export_thread_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "auth" => {
+                self.handle_auth_command(&ctx, &cmd).await;
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
@@ -1658,6 +1663,305 @@ impl Handler {
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /remind command");
         }
+    }
+
+    async fn handle_auth_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        // Reject bot users — consistent with other slash-command handlers (e.g. /remind).
+        if cmd.user.bot {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🤖 Bots cannot use `/auth`.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        // Access control — only allowed users can trigger auth.
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            cmd.user.id.get(),
+        ) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 You are not allowed to use this bot.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        // DM-only — auth codes are sensitive; reject if not in a DM channel.
+        if cmd.guild_id.is_some() {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🔒 `/auth` is only available in DMs for security. Please DM me and run `/auth` there.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        // Single-flight guard — prevent concurrent /auth invocations.
+        static AUTH_IN_PROGRESS: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if AUTH_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::Acquire) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Authentication already in progress. Please wait for it to complete.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let auth_cmd = match std::env::var("OPENAB_AGENT_AUTH_COMMAND") {
+            Ok(val) if !val.is_empty() => val,
+            _ => {
+                AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).")
+                        .ephemeral(true),
+                );
+                let _ = cmd.create_response(&ctx.http, response).await;
+                return;
+            }
+        };
+
+        // Acknowledge with a deferred ephemeral response so we have time to run the command.
+        let defer = CreateInteractionResponse::Defer(
+            CreateInteractionResponseMessage::new().ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, defer).await {
+            AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+            tracing::error!(error = %e, "failed to defer /auth response");
+            return;
+        }
+
+        let http = ctx.http.clone();
+        let token = cmd.token.clone();
+        let user_id = cmd.user.id.get();
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            use tokio::process::Command as TokioCommand;
+            use std::sync::Arc;
+
+            // Drop guard ensures AUTH_IN_PROGRESS is cleared even on panic.
+            struct AuthGuard;
+            impl Drop for AuthGuard {
+                fn drop(&mut self) {
+                    AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _guard = AuthGuard;
+
+            info!(user_id, "/auth: starting auth command");
+
+            let child = TokioCommand::new("sh")
+                .arg("-c")
+                .arg(&auth_cmd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            let mut child = match child {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(error = %e, "/auth: failed to spawn auth command");
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(format!("❌ Failed to start auth command: {e}"))
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                    return;
+                }
+            };
+
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+
+            let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let url_found = Arc::new(tokio::sync::Notify::new());
+
+            // Spawn background drain tasks — they run to EOF, keeping pipes open.
+            let lines_out = lines.clone();
+            let url_found_out = url_found.clone();
+            let stdout_task = tokio::spawn(async move {
+                if let Some(stdout) = stdout {
+                    let mut reader = tokio::io::BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        let has_url = line.contains("http://") || line.contains("https://");
+                        lines_out.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+                        if has_url {
+                            url_found_out.notify_one();
+                        }
+                    }
+                }
+            });
+
+            let lines_err = lines.clone();
+            let url_found_err = url_found.clone();
+            let stderr_task = tokio::spawn(async move {
+                if let Some(stderr) = stderr {
+                    let mut reader = tokio::io::BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        let has_url = line.contains("http://") || line.contains("https://");
+                        lines_err.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+                        if has_url {
+                            url_found_err.notify_one();
+                        }
+                    }
+                }
+            });
+
+            // Wait for a URL to appear, the command to exit early, or a 30s timeout.
+            let mut early_exit: Option<std::io::Result<std::process::ExitStatus>> = None;
+            tokio::select! {
+                _ = url_found.notified() => {
+                    info!("/auth: URL detected in output");
+                    // Brief sleep to let trailing lines (code/instructions) be captured.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                res = child.wait() => {
+                    // The auth command exited before printing a URL — fail fast
+                    // instead of waiting out the full collection window.
+                    warn!("/auth: auth command exited before a URL was detected");
+                    early_exit = Some(res);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    warn!("/auth: 30s URL-collection window expired without detecting URL");
+                }
+            }
+
+            // Handle an early exit (the command terminated during the URL window).
+            if let Some(res) = early_exit {
+                let _ = tokio::join!(stdout_task, stderr_task);
+                let collected = lines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .join("\n");
+                let detail = if collected.trim().is_empty() {
+                    String::new()
+                } else {
+                    let snippet: String = collected.chars().take(500).collect();
+                    format!("\n```\n{snippet}\n```")
+                };
+                let content = match res {
+                    Ok(status) if status.success() => {
+                        format!(
+                            "⚠️ Auth command exited (status 0) before a login URL was detected. Run `/auth` again to retry.{detail}"
+                        )
+                    }
+                    Ok(status) => {
+                        format!(
+                            "❌ Auth command exited early ({status}) before producing a login URL.{detail}"
+                        )
+                    }
+                    Err(e) => format!("❌ Error waiting for auth command: {e}"),
+                };
+                let _ = http.create_followup_message(
+                    &token,
+                    &CreateInteractionResponseFollowup::new()
+                        .content(content)
+                        .ephemeral(true),
+                    Vec::new(),
+                ).await;
+                return;
+            }
+
+            let collected_lines = lines.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+            if collected_lines.is_empty() {
+                warn!("/auth: no output captured, killing child process");
+                let _ = child.kill().await;
+                let _ = tokio::join!(stdout_task, stderr_task);
+                let _ = http.create_followup_message(
+                    &token,
+                    &CreateInteractionResponseFollowup::new()
+                        .content("⚠️ Auth command produced no output within 30 seconds. Verify `OPENAB_AGENT_AUTH_COMMAND` is set and prints a login URL to stdout/stderr.")
+                        .ephemeral(true),
+                    Vec::new(),
+                ).await;
+                return;
+            }
+
+            // Send the captured output (truncated to Discord's 2000-char limit).
+            let output = collected_lines.join("\n");
+            let prefix = "🔐 **Agent Authentication**\n```\n";
+            let suffix = "\n```\nFollow the instructions above. Waiting for authorization...";
+            // Discord enforces the 2000-char limit in UTF-16 code units; budget and
+            // truncate by UTF-16 units rather than Unicode scalar values. See
+            // `truncate_to_utf16_budget` for the testable implementation.
+            let truncated = truncate_to_utf16_budget(&output, prefix, suffix, 2000);
+            let msg = format!("{prefix}{truncated}{suffix}");
+            let _ = http.create_followup_message(
+                &token,
+                &CreateInteractionResponseFollowup::new()
+                    .content(msg)
+                    .ephemeral(true),
+                Vec::new(),
+            ).await;
+
+            // Wait for the process to complete (user authorizes in browser).
+            // Use 14min (not 15) to leave headroom for the Discord interaction token TTL.
+            let timeout = std::time::Duration::from_secs(14 * 60);
+            match tokio::time::timeout(timeout, child.wait()).await {
+                Ok(Ok(status)) if status.success() => {
+                    info!("/auth: authentication successful");
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content("✅ Authentication successful!")
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                }
+                Ok(Ok(status)) => {
+                    warn!(%status, "/auth: authentication failed");
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(format!("❌ Authentication failed (exit code: {}).", status))
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "/auth: error waiting for auth process");
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(format!("❌ Auth process error: {e}"))
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                }
+                Err(_) => {
+                    warn!("/auth: timed out waiting for authorization");
+                    let _ = child.kill().await;
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content("⏰ Authentication timed out. Run `/auth` again to retry.")
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                }
+            }
+
+            // Let background drain tasks complete.
+            let _ = tokio::join!(stdout_task, stderr_task);
+        });
     }
 
     async fn handle_export_thread_command(
@@ -2544,10 +2848,92 @@ fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
         .any(|(is_bot, content)| *is_bot && content.contains(BOT_TURN_LIMIT_WARNING_PREFIX))
 }
 
+/// Truncate `body` so that, prefixed by `prefix` and suffixed by `suffix`, the
+/// whole message fits within `limit` measured in **UTF-16 code units** — which
+/// is how Discord enforces its 2000-character message cap. Truncation only ever
+/// happens on a `char` boundary, so a multi-byte scalar (e.g. an emoji that
+/// encodes as a surrogate pair) is never split. Returns the truncated `body`
+/// (without prefix/suffix).
+///
+/// Extracted from `handle_auth_command` so the boundary arithmetic — which is
+/// easy to get wrong by conflating Unicode scalar count with UTF-16 code units —
+/// can be unit-tested in isolation.
+fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize) -> String {
+    let budget = limit
+        .saturating_sub(prefix.encode_utf16().count())
+        .saturating_sub(suffix.encode_utf16().count());
+    let mut truncated = String::new();
+    let mut used = 0usize;
+    for ch in body.chars() {
+        let w = ch.len_utf16();
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        truncated.push(ch);
+    }
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
+
+    // --- truncate_to_utf16_budget tests (#1185 /auth output relay) ---
+
+    /// Body shorter than the budget is returned unchanged.
+    #[test]
+    fn truncate_utf16_short_body_unchanged() {
+        assert_eq!(truncate_to_utf16_budget("hello", "", "", 2000), "hello");
+    }
+
+    /// prefix + suffix consume the budget; the body gets the remainder.
+    #[test]
+    fn truncate_utf16_respects_prefix_suffix_budget() {
+        // limit 10, prefix "pre" (3) + suffix "su" (2) = 5 → 5 ASCII units left.
+        assert_eq!(truncate_to_utf16_budget("abcdefghij", "pre", "su", 10), "abcde");
+    }
+
+    /// A supplementary-plane scalar counts as TWO UTF-16 code units, not one.
+    #[test]
+    fn truncate_utf16_counts_surrogate_pairs_as_two_units() {
+        // '🔐' (U+1F510) is one scalar but two UTF-16 units.
+        // Budget 5 → two emoji (4 units) fit; a third (→6) does not.
+        let out = truncate_to_utf16_budget("🔐🔐🔐", "", "", 5);
+        assert_eq!(out, "🔐🔐");
+        assert_eq!(out.encode_utf16().count(), 4);
+    }
+
+    /// A scalar is never split: a 2-unit emoji cannot fit a 1-unit budget.
+    #[test]
+    fn truncate_utf16_never_splits_a_scalar() {
+        assert_eq!(truncate_to_utf16_budget("🔐rest", "", "", 1), "");
+    }
+
+    /// When affixes alone exceed the limit, the budget saturates to zero.
+    #[test]
+    fn truncate_utf16_zero_budget_when_affixes_exceed_limit() {
+        assert_eq!(
+            truncate_to_utf16_budget("anything", "longprefix", "longsuffix", 4),
+            ""
+        );
+    }
+
+    /// The assembled message (prefix + body + suffix) never exceeds the limit,
+    /// even for output dense with multi-unit scalars — this is the regression
+    /// guard for the original `chars().count()` (scalar) miscount.
+    #[test]
+    fn truncate_utf16_assembled_total_within_limit() {
+        let prefix = "🔐 **Agent Authentication**\n```\n";
+        let suffix = "\n```\nFollow the instructions above. Waiting for authorization...";
+        let body = "https://example.com/device AB🔐CD\n".repeat(200);
+        let out = truncate_to_utf16_budget(&body, prefix, suffix, 2000);
+        let total = prefix.encode_utf16().count()
+            + out.encode_utf16().count()
+            + suffix.encode_utf16().count();
+        assert!(total <= 2000, "assembled total {total} exceeds 2000");
+    }
 
     // --- resolve_mentions tests ---
 
