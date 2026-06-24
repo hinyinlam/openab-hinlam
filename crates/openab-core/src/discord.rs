@@ -1670,9 +1670,39 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
+        // Access control — only allowed users can trigger auth.
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            cmd.user.id.get(),
+        ) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 You are not allowed to use this bot.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        // Single-flight guard — prevent concurrent /auth invocations.
+        static AUTH_IN_PROGRESS: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if AUTH_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Authentication already in progress. Please wait for it to complete.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
         let auth_cmd = match std::env::var("OPENAB_AGENT_AUTH_COMMAND") {
             Ok(val) if !val.is_empty() => val,
             _ => {
+                AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                 let response = CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
                         .content("⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).")
@@ -1688,6 +1718,7 @@ impl Handler {
             CreateInteractionResponseMessage::new().ephemeral(true),
         );
         if let Err(e) = cmd.create_response(&ctx.http, defer).await {
+            AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
             tracing::error!(error = %e, "failed to defer /auth response");
             return;
         }
@@ -1716,6 +1747,7 @@ impl Handler {
                             .ephemeral(true),
                         Vec::new(),
                     ).await;
+                    AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                     return;
                 }
             };
@@ -1727,7 +1759,7 @@ impl Handler {
             let mut lines: Vec<String> = Vec::new();
 
             // Collect output from both streams until we find a URL or the process ends.
-            let collect = async {
+            {
                 let mut stdout_reader = stdout.map(|s| tokio::io::BufReader::new(s).lines());
                 let mut stderr_reader = stderr.map(|s| tokio::io::BufReader::new(s).lines());
 
@@ -1800,11 +1832,10 @@ impl Handler {
                         break;
                     }
                 }
-            };
-
-            collect.await;
+            } // readers dropped here; child still owns the pipes
 
             if lines.is_empty() {
+                let _ = child.kill().await;
                 let _ = http.create_followup_message(
                     &token,
                     &CreateInteractionResponseFollowup::new()
@@ -1812,12 +1843,21 @@ impl Handler {
                         .ephemeral(true),
                     Vec::new(),
                 ).await;
+                AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                 return;
             }
 
-            // Send the captured output to the user
+            // Send the captured output to the user (truncate to fit Discord's 2000-char limit).
             let output = lines.join("\n");
-            let msg = format!("🔐 **Agent Authentication**\n```\n{}\n```\nFollow the instructions above. Waiting for authorization...", output);
+            let prefix = "🔐 **Agent Authentication**\n```\n";
+            let suffix = "\n```\nFollow the instructions above. Waiting for authorization...";
+            let max_output = 2000 - prefix.len() - suffix.len();
+            let truncated = if output.len() > max_output {
+                &output[..max_output]
+            } else {
+                &output
+            };
+            let msg = format!("{prefix}{truncated}{suffix}");
             let _ = http.create_followup_message(
                 &token,
                 &CreateInteractionResponseFollowup::new()
@@ -1868,6 +1908,7 @@ impl Handler {
                     ).await;
                 }
             }
+            AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
         });
     }
 
