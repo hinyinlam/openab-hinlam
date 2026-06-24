@@ -1899,21 +1899,10 @@ impl Handler {
             let output = collected_lines.join("\n");
             let prefix = "🔐 **Agent Authentication**\n```\n";
             let suffix = "\n```\nFollow the instructions above. Waiting for authorization...";
-            // Discord enforces the 2000-char limit in UTF-16 code units, so budget
-            // and truncate by UTF-16 units rather than Unicode scalar values.
-            let budget = 2000usize
-                .saturating_sub(prefix.encode_utf16().count())
-                .saturating_sub(suffix.encode_utf16().count());
-            let mut truncated = String::new();
-            let mut used = 0usize;
-            for ch in output.chars() {
-                let w = ch.len_utf16();
-                if used + w > budget {
-                    break;
-                }
-                used += w;
-                truncated.push(ch);
-            }
+            // Discord enforces the 2000-char limit in UTF-16 code units; budget and
+            // truncate by UTF-16 units rather than Unicode scalar values. See
+            // `truncate_to_utf16_budget` for the testable implementation.
+            let truncated = truncate_to_utf16_budget(&output, prefix, suffix, 2000);
             let msg = format!("{prefix}{truncated}{suffix}");
             let _ = http.create_followup_message(
                 &token,
@@ -1948,6 +1937,7 @@ impl Handler {
                     ).await;
                 }
                 Ok(Err(e)) => {
+                    tracing::error!(error = %e, "/auth: error waiting for auth process");
                     let _ = http.create_followup_message(
                         &token,
                         &CreateInteractionResponseFollowup::new()
@@ -2858,10 +2848,92 @@ fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
         .any(|(is_bot, content)| *is_bot && content.contains(BOT_TURN_LIMIT_WARNING_PREFIX))
 }
 
+/// Truncate `body` so that, prefixed by `prefix` and suffixed by `suffix`, the
+/// whole message fits within `limit` measured in **UTF-16 code units** — which
+/// is how Discord enforces its 2000-character message cap. Truncation only ever
+/// happens on a `char` boundary, so a multi-byte scalar (e.g. an emoji that
+/// encodes as a surrogate pair) is never split. Returns the truncated `body`
+/// (without prefix/suffix).
+///
+/// Extracted from `handle_auth_command` so the boundary arithmetic — which is
+/// easy to get wrong by conflating Unicode scalar count with UTF-16 code units —
+/// can be unit-tested in isolation.
+fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize) -> String {
+    let budget = limit
+        .saturating_sub(prefix.encode_utf16().count())
+        .saturating_sub(suffix.encode_utf16().count());
+    let mut truncated = String::new();
+    let mut used = 0usize;
+    for ch in body.chars() {
+        let w = ch.len_utf16();
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        truncated.push(ch);
+    }
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
+
+    // --- truncate_to_utf16_budget tests (#1185 /auth output relay) ---
+
+    /// Body shorter than the budget is returned unchanged.
+    #[test]
+    fn truncate_utf16_short_body_unchanged() {
+        assert_eq!(truncate_to_utf16_budget("hello", "", "", 2000), "hello");
+    }
+
+    /// prefix + suffix consume the budget; the body gets the remainder.
+    #[test]
+    fn truncate_utf16_respects_prefix_suffix_budget() {
+        // limit 10, prefix "pre" (3) + suffix "su" (2) = 5 → 5 ASCII units left.
+        assert_eq!(truncate_to_utf16_budget("abcdefghij", "pre", "su", 10), "abcde");
+    }
+
+    /// A supplementary-plane scalar counts as TWO UTF-16 code units, not one.
+    #[test]
+    fn truncate_utf16_counts_surrogate_pairs_as_two_units() {
+        // '🔐' (U+1F510) is one scalar but two UTF-16 units.
+        // Budget 5 → two emoji (4 units) fit; a third (→6) does not.
+        let out = truncate_to_utf16_budget("🔐🔐🔐", "", "", 5);
+        assert_eq!(out, "🔐🔐");
+        assert_eq!(out.encode_utf16().count(), 4);
+    }
+
+    /// A scalar is never split: a 2-unit emoji cannot fit a 1-unit budget.
+    #[test]
+    fn truncate_utf16_never_splits_a_scalar() {
+        assert_eq!(truncate_to_utf16_budget("🔐rest", "", "", 1), "");
+    }
+
+    /// When affixes alone exceed the limit, the budget saturates to zero.
+    #[test]
+    fn truncate_utf16_zero_budget_when_affixes_exceed_limit() {
+        assert_eq!(
+            truncate_to_utf16_budget("anything", "longprefix", "longsuffix", 4),
+            ""
+        );
+    }
+
+    /// The assembled message (prefix + body + suffix) never exceeds the limit,
+    /// even for output dense with multi-unit scalars — this is the regression
+    /// guard for the original `chars().count()` (scalar) miscount.
+    #[test]
+    fn truncate_utf16_assembled_total_within_limit() {
+        let prefix = "🔐 **Agent Authentication**\n```\n";
+        let suffix = "\n```\nFollow the instructions above. Waiting for authorization...";
+        let body = "https://example.com/device AB🔐CD\n".repeat(200);
+        let out = truncate_to_utf16_budget(&body, prefix, suffix, 2000);
+        let total = prefix.encode_utf16().count()
+            + out.encode_utf16().count()
+            + suffix.encode_utf16().count();
+        assert!(total <= 2000, "assembled total {total} exceeds 2000");
+    }
 
     // --- resolve_mentions tests ---
 
