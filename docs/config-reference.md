@@ -243,15 +243,15 @@ Lifecycle hooks that run at specific points during the container lifecycle. See 
 
 ### `[hooks.pre_seed]`
 
-Downloads and extracts zip archives from S3 before `pre_boot`. Seeds the agent environment with configs, tools, and shared memory without requiring AWS CLI in the image.
+Downloads and extracts archives from S3 before `pre_boot`. Seeds the agent environment with configs, tools, and shared memory without requiring AWS CLI in the image.
 
 > **Feature flag:** requires the `pre-seed` feature (opt-in, not in default). Enable with `--features pre-seed`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `sources` | string[] | `[]` | S3 URIs of zip archives (`s3://bucket/key.zip`). Max 5. Extracted in order; later layers overwrite earlier ones. |
+| `sources` | string[] | `[]` | S3 URIs of archives (`.zip`, `.tar.gz`, `.tgz`). Max 5. Extracted in order; later layers overwrite earlier ones. |
 | `target` | string | `$HOME` | Extraction target directory. |
-| `max_bytes` | u64 | `104857600` | Max compressed zip size in bytes (100 MiB). Rejects downloads exceeding this. |
+| `max_bytes` | u64 | `104857600` | Max compressed archive size in bytes (100 MiB). Rejects downloads exceeding this. |
 | `timeout_seconds` | u64 | `300` | Per-source download+extract timeout in seconds. |
 | `on_failure` | string | `"abort"` | `"abort"` exits openab; `"warn"` logs and continues. |
 | `region` | string | — | Override AWS region for S3 access. |
@@ -265,9 +265,9 @@ environment variables, shared credentials, IRSA / EKS Pod Identity, ECS task rol
 ```toml
 [hooks.pre_seed]
 sources = [
-  "s3://my-bucket/base-env.zip",
+  "s3://my-bucket/base-env.tar.gz",
   "s3://my-bucket/shared-memory.zip",
-  "s3://my-bucket/agent-overrides.zip",
+  "s3://my-bucket/agent-overrides.tgz",
 ]
 timeout_seconds = 300
 on_failure = "abort"

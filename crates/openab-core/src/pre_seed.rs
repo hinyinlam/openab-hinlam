@@ -164,16 +164,24 @@ async fn download_and_extract(
     Ok(())
 }
 
-/// Extract zip to a temp directory with budget enforcement, then move into target.
+/// Extract archive to a temp directory with budget enforcement, then move into target.
+/// Supports zip and gzipped tarball formats (detected via magic bytes).
 /// Checks deadline cooperatively before each file operation.
-fn extract_and_apply(data: &[u8], target: &Path, deadline: Instant) -> anyhow::Result<()> {
+fn extract_and_apply(
+    data: &[u8],
+    target: &Path,
+    deadline: Instant,
+) -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir_in(target.parent().unwrap_or(target))?;
 
-    extract_zip_with_limits(data, temp_dir.path(), deadline)?;
+    if data.starts_with(&[0x1f, 0x8b]) {
+        extract_tarball_with_limits(data, temp_dir.path(), deadline)?;
+    } else {
+        extract_zip_with_limits(data, temp_dir.path(), deadline)?;
+    }
 
     // Check deadline before applying to target
     if Instant::now() >= deadline {
-        // temp_dir drops and cleans up automatically
         anyhow::bail!("hooks.pre_seed: timed out before applying to target");
     }
 
@@ -248,6 +256,62 @@ fn extract_zip_budgeted(
                 use std::os::unix::fs::PermissionsExt;
                 if let Some(mode) = file.unix_mode() {
                     std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract a .tar.gz/.tgz archive with cooperative deadline checks and size budget.
+fn extract_tarball_with_limits(data: &[u8], dest: &Path, deadline: Instant) -> anyhow::Result<()> {
+    use flate2::read::GzDecoder;
+
+    let decoder = GzDecoder::new(data);
+    let mut archive = tar::Archive::new(decoder);
+    archive.set_preserve_permissions(false);
+
+    let mut file_count: usize = 0;
+    let mut total_extracted: u64 = 0;
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+
+        file_count += 1;
+        if file_count > DEFAULT_MAX_FILE_COUNT {
+            anyhow::bail!(
+                "hooks.pre_seed: tarball contains too many entries ({file_count}, max {DEFAULT_MAX_FILE_COUNT})"
+            );
+        }
+
+        // Cooperative deadline check every 10 files
+        if file_count % 10 == 0 && Instant::now() >= deadline {
+            anyhow::bail!("hooks.pre_seed: timed out during tarball extraction at entry {file_count}");
+        }
+
+        // Size budget
+        total_extracted += entry.size();
+        if total_extracted > DEFAULT_MAX_EXTRACTED_BYTES {
+            anyhow::bail!(
+                "hooks.pre_seed: extracted size exceeds limit ({total_extracted} > {DEFAULT_MAX_EXTRACTED_BYTES})"
+            );
+        }
+
+        entry.unpack_in(dest)?;
+
+        // Manually set permissions (strip suid/sgid/sticky, like zip path)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(path) = entry.path() {
+                let out_path = dest.join(path);
+                if out_path.is_file() {
+                    let mode = entry.header().mode().unwrap_or(0o644) & 0o0777;
+                    let _ = std::fs::set_permissions(
+                        &out_path,
+                        std::fs::Permissions::from_mode(mode),
+                    );
                 }
             }
         }
@@ -489,5 +553,102 @@ mod tests {
             result.unwrap_err().to_string().contains("too many entries"),
             "should fail on file count limit"
         );
+    }
+
+    #[test]
+    fn extract_tarball_basic() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let dir = tempfile::tempdir().unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+
+        let buf = Vec::new();
+        let enc = GzEncoder::new(buf, Compression::default());
+        let mut builder = tar::Builder::new(enc);
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(5);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, "hello.txt", &b"world"[..])
+            .unwrap();
+
+        let mut header2 = tar::Header::new_gnu();
+        header2.set_size(14);
+        header2.set_mode(0o644);
+        builder
+            .append_data(&mut header2, "sub/nested.txt", &b"nested content"[..])
+            .unwrap();
+
+        let enc = builder.into_inner().unwrap();
+        let tarball_bytes = enc.finish().unwrap();
+
+        extract_tarball_with_limits(&tarball_bytes, dir.path(), deadline).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "world"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sub/nested.txt")).unwrap(),
+            "nested content"
+        );
+    }
+
+    #[test]
+    fn extract_and_apply_detects_tarball_via_magic_bytes() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let target = tempfile::tempdir().unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+
+        let buf = Vec::new();
+        let enc = GzEncoder::new(buf, Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(5);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, "hello.txt", &b"world"[..])
+            .unwrap();
+        let enc = builder.into_inner().unwrap();
+        let tarball_bytes = enc.finish().unwrap();
+
+        // Magic bytes detection — no URI needed
+        extract_and_apply(&tarball_bytes, target.path(), deadline).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.path().join("hello.txt")).unwrap(),
+            "world"
+        );
+    }
+
+    #[test]
+    fn extract_tarball_respects_deadline() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let dir = tempfile::tempdir().unwrap();
+        let expired = Instant::now() - std::time::Duration::from_secs(1);
+
+        let buf = Vec::new();
+        let enc = GzEncoder::new(buf, Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        // Create > 10 files to trigger deadline check
+        for i in 0..11 {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            builder
+                .append_data(&mut header, format!("f{i}.txt"), &b"x"[..])
+                .unwrap();
+        }
+        let enc = builder.into_inner().unwrap();
+        let tarball_bytes = enc.finish().unwrap();
+
+        let result = extract_tarball_with_limits(&tarball_bytes, dir.path(), expired);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timed out"));
     }
 }

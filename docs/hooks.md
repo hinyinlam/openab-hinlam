@@ -10,13 +10,13 @@ hooks.pre_seed → hooks.pre_boot → (agent running) → hooks.pre_shutdown
 
 | Phase | Purpose | Config | Action Type |
 |-------|---------|--------|-------------|
-| `pre_seed` | Download & extract S3 zip archives to seed the environment | `[hooks.pre_seed]` | Built-in S3 download + unzip |
+| `pre_seed` | Download & extract S3 archives to seed the environment | `[hooks.pre_seed]` | Built-in S3 download + extract |
 | `pre_boot` | Run custom setup scripts before agent pool creation | `[hooks.pre_boot]` | User script |
 | `pre_shutdown` | Run custom cleanup scripts after pool shutdown | `[hooks.pre_shutdown]` | User script |
 
 ## Pre-Seed Phase
 
-The `pre_seed` phase runs **before** `pre_boot`. It downloads zip archives from S3 and extracts them into the agent's home directory (or a custom target). This eliminates the need for users to install AWS CLI and write download scripts in `pre_boot`.
+The `pre_seed` phase runs **before** `pre_boot`. It downloads archives from S3 and extracts them into the agent's home directory (or a custom target). Supported formats: `.zip`, `.tar.gz`, and `.tgz` (auto-detected via magic bytes). This eliminates the need for users to install AWS CLI and write download scripts in `pre_boot`.
 
 > **Feature flag:** requires the `pre-seed` feature (opt-in, not in default).
 
@@ -25,12 +25,12 @@ The `pre_seed` phase runs **before** `pre_boot`. It downloads zip archives from 
 ```toml
 [hooks.pre_seed]
 sources = [
-  "s3://my-bucket/base-env.zip",
+  "s3://my-bucket/base-env.tar.gz",
   "s3://my-bucket/shared-memory.zip",
-  "s3://my-bucket/agent-overrides.zip",
+  "s3://my-bucket/agent-overrides.tgz",
 ]
 # target = "/home/agent"                  # default: $HOME
-# max_bytes = 104857600                   # max compressed size per zip (default: 100 MiB)
+# max_bytes = 104857600                   # max compressed size per archive (default: 100 MiB)
 # timeout_seconds = 300                   # per-source timeout (default: 300)
 # on_failure = "abort"                    # "abort" or "warn" (default: "abort")
 # region = "us-west-2"                    # optional: override AWS region
@@ -41,9 +41,9 @@ sources = [
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `sources` | string[] | `[]` | S3 URIs of zip archives. Max 5. Extracted in order. |
+| `sources` | string[] | `[]` | S3 URIs of archives (`.zip`, `.tar.gz`, `.tgz`). Max 5. Extracted in order. |
 | `target` | string | `$HOME` | Extraction target directory. |
-| `max_bytes` | u64 | `104857600` | Max compressed zip size in bytes (100 MiB). |
+| `max_bytes` | u64 | `104857600` | Max compressed archive size in bytes (100 MiB). |
 | `timeout_seconds` | u64 | `300` | Per-source download+extract timeout. |
 | `on_failure` | string | `"abort"` | `"abort"` exits openab; `"warn"` logs and continues. |
 | `region` | string | — | Override AWS region. |
@@ -67,14 +67,15 @@ Layer 1 (first)  ─── base layer
   1. **S3-native checksum (automatic)**: if the object was uploaded with `--checksum-algorithm SHA256`, OpenAB automatically verifies it on download — no config needed
   2. **User-provided `sha256s` (optional)**: explicit checksums in config for additional defense-in-depth
 - **Size cap**: downloads exceeding `max_bytes` are rejected before extraction
-- **Atomic extraction**: zips are first extracted to a temp directory, then moved into target — if extraction fails, target is not corrupted. Note: the move phase is per-file; if it fails mid-way with `on_failure = "warn"`, the target may be partially updated.
-- **Zip Slip prevention**: uses `enclosed_name()` to block path traversal attacks
+- **Atomic extraction**: archives are first extracted to a temp directory, then moved into target — if extraction fails, target is not corrupted. Note: the move phase is per-file; if it fails mid-way with `on_failure = "warn"`, the target may be partially updated.
+- **Path traversal prevention**: zip uses `enclosed_name()`; tarball uses `unpack_in()` which rejects `..` escapes
+- **Permission hardening**: suid/sgid/sticky bits are stripped from extracted files
 
 ### Constraints
 
 - Maximum **5** sources
 - Only `s3://` URIs supported
-- Only `.zip` format supported
+- Supported formats: `.zip`, `.tar.gz`, `.tgz` (auto-detected via gzip magic bytes)
 - Uses the standard AWS credential chain (IRSA, ECS task role, env vars)
 - Optional `region`/`endpoint_url` override for LocalStack or VPC endpoints
 
