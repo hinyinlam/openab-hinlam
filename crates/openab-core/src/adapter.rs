@@ -1898,6 +1898,8 @@ mod tests {
 #[cfg(test)]
 mod directive_tests {
     use super::parse_output_directives;
+    use super::{classify_empty_turn, SILENT_FAILURE_MSG};
+    use crate::acp::TurnResult;
 
     #[test]
     fn parse_reply_to_directive() {
