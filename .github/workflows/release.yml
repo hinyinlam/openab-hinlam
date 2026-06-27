@@ -10,6 +10,10 @@ on:
 
 jobs:
   release:
+    # Chart publishing requires the canonical repository's GitHub Pages branch.
+    # Forks/private mirrors can build and test charts, but should not run the
+    # chart-releaser publishing path because they may not have gh-pages set up.
+    if: github.repository == 'openabdev/openab'
     runs-on: ubuntu-latest
     permissions:
       contents: write

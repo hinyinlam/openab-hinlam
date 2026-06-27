@@ -5,6 +5,11 @@ edition = "2021"
 license = "MIT"
 description = "Native Rust coding agent with built-in ACP support"
 
+# Keep this crate independent from the top-level OpenAB workspace. The
+# openab-agent CI runs with working-directory=openab-agent, so cargo must not
+# try to resolve it through the parent workspace manifest.
+[workspace]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
