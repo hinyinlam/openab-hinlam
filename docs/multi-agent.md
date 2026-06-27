@@ -10,7 +10,6 @@ helm install openab openab/openab \
   --set-string 'agents.kiro.discord.allowedChannels[0]=KIRO_CHANNEL_ID' \
   --set agents.claude.discord.botToken="$CLAUDE_BOT_TOKEN" \
   --set-string 'agents.claude.discord.allowedChannels[0]=CLAUDE_CHANNEL_ID' \
-  --set agents.claude.image=ghcr.io/openabdev/openab-claude:latest \
   --set agents.claude.command=claude-agent-acp \
   --set agents.claude.workingDir=/home/node
 ```
@@ -30,17 +29,14 @@ helm install openab openab/openab \
   --set-string 'agents.kiro.discord.allowedChannels[0]=KIRO_CHANNEL_ID' \
   --set agents.claude.discord.botToken="$CLAUDE_BOT_TOKEN" \
   --set-string 'agents.claude.discord.allowedChannels[0]=CLAUDE_CHANNEL_ID' \
-  --set agents.claude.image=ghcr.io/openabdev/openab-claude:latest \
   --set agents.claude.command=claude-agent-acp \
   --set agents.claude.workingDir=/home/node \
   --set agents.codex.discord.botToken="$CODEX_BOT_TOKEN" \
   --set-string 'agents.codex.discord.allowedChannels[0]=CODEX_CHANNEL_ID' \
-  --set agents.codex.image=ghcr.io/openabdev/openab-codex:latest \
   --set agents.codex.command=codex-acp \
   --set agents.codex.workingDir=/home/node \
   --set agents.gemini.discord.botToken="$GEMINI_BOT_TOKEN" \
   --set-string 'agents.gemini.discord.allowedChannels[0]=GEMINI_CHANNEL_ID' \
-  --set agents.gemini.image=ghcr.io/openabdev/openab-gemini:latest \
   --set agents.gemini.command=gemini \
   --set agents.gemini.args='{--acp}' \
   --set agents.gemini.workingDir=/home/node
@@ -76,6 +72,8 @@ allow_bot_messages = "mentions"  # recommended
 **`"mentions"` is recommended for most setups.** It enables collaboration while acting as a natural loop breaker — Bot A only processes Bot B's message if Bot B explicitly @mentions Bot A. Two bots won't accidentally ping-pong.
 
 Use `"all"` only when bots need to react to each other's messages without explicit mentions (e.g. monitoring bots). A hard cap of 10 consecutive bot-to-bot turns prevents infinite loops.
+
+> **💡 User messages in multi-bot threads:** The default `allow_user_messages = "multibot-mentions"` already handles the user→bot side — once multiple bots are in a thread, users must @mention the specific bot they want to respond. No extra config needed.
 
 ### Example: Code Review → Deploy handoff
 
